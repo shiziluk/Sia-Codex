@@ -138,6 +138,62 @@ test("unsupported clients retain the original asynchronous result and error", as
   }
 });
 
+test("managed headers preserve policy and attach the session label", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cpp-browser-managed-"));
+  const path = join(dir, "control.json");
+  const turn = { session_id: "fixture-session", turn_id: "fixture-turn" };
+  const inherited = [
+    { name: "x-existing", value: "kept" },
+    { name: "X-Browser-Agent", value: "old" },
+  ];
+  const info = {
+    type: "extension", family: "chrome", requestHeadersVersion: 1,
+    metadata: { extensionId: "hehggadaopoacecdllhhajmbjkdcmajg", extensionInstanceId: "fixture-extension" },
+  };
+  try {
+    await writeFile(path, JSON.stringify({ schema: 1, requireIdentification: true }));
+    const decide = reader({}, async () => inherited, () => turn, path);
+    assert.deepEqual(await decide.call({ clientInfo: info }), [
+      { name: "x-existing", value: "kept" },
+      { name: "x-browser-agent", value: "ChatGPT/fixture-session" },
+    ]);
+    const empty = reader({}, async () => undefined, () => turn, path);
+    assert.deepEqual(await empty.call({ clientInfo: info }),
+      [{ name: "x-browser-agent", value: "ChatGPT/fixture-session" }]);
+  } finally {
+    await rm(path, { force: true });
+    await rmdir(dir);
+  }
+});
+
+test("unsupported managed protocol and unreadable fallback keep the original path", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cpp-browser-managed-fallback-"));
+  const path = join(dir, "control.json");
+  const turn = { session_id: "fixture-session", turn_id: "fixture-turn" };
+  const base = {
+    type: "extension", family: "edge",
+    metadata: { extensionId: "odlomjlbamekndcpllcnffbgeohgkmjh", extensionInstanceId: "fixture-extension" },
+  };
+  try {
+    await writeFile(path, JSON.stringify({ schema: 1, requireIdentification: true }));
+    for (const info of [
+      { ...base, requestHeadersVersion: 2 },
+      { ...base, requestHeadersVersion: "1" },
+      { ...base, requestHeadersVersion: 1, metadata: { ...base.metadata, extensionId: "unknown" } },
+    ]) {
+      const fallback = [{ name: "x-fallback", value: "kept" }];
+      const decide = reader({}, async () => fallback, () => turn, path);
+      assert.deepEqual(await decide.call({ clientInfo: info }), fallback);
+    }
+    const original = [{ name: "x-original", value: "kept" }];
+    const unchanged = reader({}, async () => original, () => turn, "unused");
+    assert.equal(await unchanged.call({ clientInfo: { ...base, requestHeadersVersion: 1 } }), original);
+  } finally {
+    await rm(path, { force: true });
+    await rmdir(dir);
+  }
+});
+
 test("invalid control files never opt in either browser", async () => {
   const dir = await mkdtemp(join(tmpdir(), "cpp-browser-control-"));
   const path = join(dir, "control.json");

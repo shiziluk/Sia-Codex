@@ -2044,6 +2044,7 @@ mod tests {
         contract.binding = Some(structural::Binding {
             start, end: start + 2, policy: "cD".into(), metadata: "ze".into(),
             contract_sha: "eae1b49427aebf3ed3d1119de1c303125c4f78b3b0ca644f055ed07ec2c2be30".into(),
+            callback: None,
         });
         let modified = fs::metadata(&service).unwrap().modified().unwrap();
         reconcile_contract(&paths, true, &contract).unwrap();
@@ -2071,6 +2072,7 @@ mod tests {
         contract.binding = Some(structural::Binding {
             start, end: start + 2, policy: "cD".into(), metadata: "ze".into(),
             contract_sha: "5bf64da3b8386af46a6fb2c2d8829a507130ba9896237a813b8e04c4ce8eb515".into(),
+            callback: None,
         });
         reconcile_contract(&paths, true, &contract).unwrap();
         fs::write(&service, b"external edit").unwrap();
