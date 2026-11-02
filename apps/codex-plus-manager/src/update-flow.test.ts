@@ -7,6 +7,13 @@ import { UpdateNotifications } from "./update-notification.ts";
 const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
 const file = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 
+test("downstream update UI only reports upstream changes and exposes no installer action", () => {
+  assert.doesNotMatch(source, /下载并运行安装包/);
+  assert.doesNotMatch(source, /立即更新/);
+  assert.match(source, /仅提示，不自动安装/);
+  assert.match(source, /本构建不会下载或启动上游安装包/);
+});
+
 function handler(name: string, dependencies: Record<string, unknown>): (...args: any[]) => Promise<void> {
   let expression = "";
   const visit = (node: ts.Node) => {

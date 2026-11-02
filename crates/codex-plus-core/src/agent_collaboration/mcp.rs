@@ -7,13 +7,19 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Store, TaskRecord, TaskRequest, executor, is_terminal};
+use super::{
+    Store, TaskRecord, TaskRequest, WorkflowPhase, executor, is_terminal, pipeline, protocol,
+};
 
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_WAIT_MS: u64 = 30_000;
 const MAX_CONCURRENT_WAITS: usize = 8;
 
-const INSTRUCTIONS: &str = "在当前 Codex 对话中承接用户的自然语言委派。用户明确要求 DeepSeek/DeepSeek Harness 时调用 delegate_to_deepseek；明确要求 Claude/Claude Code 时调用 delegate_to_claude_code；明确要求另一个 Codex 时调用 delegate_to_codex，不能用默认 Agent 替换用户点名的对象。用户泛指委派给其他 Agent、未指定对象时使用 delegate_task，省略 agentId 会采用 Codex++ 配置的默认 Agent；显式 agentId 始终优先。用户的委派请求已构成执行该任务的授权，不要再要求每次确认，也不要让用户去管理面板手工提交任务。提供完整、自包含的 prompt 和已存在的绝对 cwd。工具可能编辑该目录并消耗原生 CLI 账户额度，权限仍由各 CLI 控制。返回 queued/taskId 只代表任务已接收；先继续独立工作，再用 wait_task（每次最多 30 秒）或 get_task 收取结果，必须把结果带回当前对话。pending=true 时可继续工作并稍后查询；只有 task.status=completed 才能报告子任务成功，failed/cancelled/interrupted 必须如实说明，结果不确定时禁止自动重发。同一 Agent 可以同时运行多个任务（并发上限在 Codex++ 中按 Agent 设置，默认 1），互不依赖的子任务可以连续派发、各自用 taskId 收取；运行中的任务达到上限时新任务会排队（返回 queued 和排队进度），任一任务结束后按提交顺序自动启动，不同 Agent 可并行。并发任务各自独立进程和会话，但会在各自 cwd 中直接改文件：可能同时运行的任务应使用不同的 cwd（例如各自的 git worktree），返回 cwdWarning 时说明同目录有其他任务可能同时运行；只有排队已满、目标未启用或不可用时才报错，此时报告该目标的问题，不擅自改派。continueTaskId 只续本工具先前创建的同 Agent、同目录已完成 CLI 会话。这些是外部 harness/CLI 协作任务，不是原生 spawn_agent 子树，也不能接管或唤醒同窗口中已有桌面会话。";
+const INSTRUCTIONS: &str = "在当前 Codex 对话中承接用户的自然语言委派。用户明确要求 DeepSeek/DeepSeek Harness 时调用 delegate_to_deepseek；明确要求 Claude/Claude Code 时调用 delegate_to_claude_code；明确要求 WorkBuddy 时调用 delegate_to_workbuddy；明确要求 Trae/Trae CN 时调用 delegate_to_trae；明确要求另一个 Codex 时调用 delegate_to_codex，不能用默认 Agent 替换用户点名的对象。用户泛指委派给其他 Agent、未指定对象时使用 delegate_task，省略 agentId 会采用 Codex++ 配置的默认 Agent；显式 agentId 始终优先。用户的委派请求已构成执行该任务的授权，不要再要求每次确认，也不要让用户去管理面板手工提交任务。提供完整、自包含的 prompt 和已存在的绝对 cwd。工具可能编辑该目录并消耗原生 CLI 账户额度，权限仍由各 CLI 控制。返回 queued/taskId 只代表任务已接收；先继续独立工作，再用 wait_task（每次最多 30 秒）或 get_task 收取结果，必须把结果带回当前对话。pending=true 时可继续工作并稍后查询；只有 task.status=completed 才能报告子任务成功，failed/cancelled/interrupted 必须如实说明。handed_off 表示 Trae 窗口已交付但最终答复未自动确认，也不能报告成功；结果不确定时禁止自动重发。同一 Agent 可以同时运行多个任务（并发上限在 Codex++ 中按 Agent 设置，默认 1），互不依赖的子任务可以连续派发、各自用 taskId 收取；运行中的任务达到上限时新任务会排队（返回 queued 和排队进度），任一任务结束后按提交顺序自动启动，不同 Agent 可并行。并发任务各自独立进程和会话，但会在各自 cwd 中直接改文件：可能同时运行的任务应使用不同的 cwd（例如各自的 git worktree），返回 cwdWarning 时说明同目录有其他任务可能同时运行；只有排队已满、目标未启用或不可用时才报错，此时报告该目标的问题，不擅自改派。continueTaskId 只续本工具先前创建的同 Agent、同目录已完成 CLI 会话。WorkBuddy 是纯文本适配器；Trae 是 GUI 交付适配器，会使用 cwd 内的隐藏结果交接文件，拿不到结果时返回 handed_off。这些是外部 harness/CLI 协作任务，不是原生 spawn_agent 子树，也不能接管或唤醒同窗口中已有桌面会话。";
+
+fn active_instructions() -> String {
+    format!("{INSTRUCTIONS}\n\n复杂、跨步骤、需要独立审核的任务使用 sansheng_dispatch，由 root 指定不同的规划/审核 agent 和执行默认 agent。工作流会依次规划、审核、执行、结果复核；只有 phase=awaiting_acceptance 后，root 才能用 sansheng_accept 做最终验收。审核封驳不得绕过，使用 sansheng_status 查询完整阶段和子任务。简单任务继续使用普通 delegate 工具，不要为了形式强制走三省。")
+}
 
 enum InputLine {
     Data(Vec<u8>),
@@ -23,7 +29,11 @@ enum InputLine {
 
 /// 不启用 tokio io-std；有界读取放到专用 blocking 线程，不阻塞 CLI worker。
 pub async fn serve(store: Store) -> anyhow::Result<()> {
-    let result = serve_loop(store).await;
+    let result = async {
+        super::pipeline::resume_incomplete_workflows(&store).await?;
+        serve_loop(store).await
+    }
+    .await;
     // EOF、协议输出失败和输入读取失败均收口到这里，只停止此进程拥有的任务。
     executor::shutdown_owned_tasks().await;
     result
@@ -201,7 +211,7 @@ pub fn handle_request(store: &Store, request: Value) -> Option<Value> {
             };
             json!({"protocolVersion": version, "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "codex-plus-agent-collaboration", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": INSTRUCTIONS})
+                "instructions": active_instructions()})
         }
         "ping" => json!({}),
         "tools/list" => json!({"tools": tool_definitions()}),
@@ -264,6 +274,68 @@ struct FixedDelegateArguments {
     continue_task_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SanshengDispatchArguments {
+    objective: String,
+    cwd: String,
+    planner_agent_id: String,
+    reviewer_agent_id: String,
+    executor_agent_id: String,
+    #[serde(default)]
+    allowed_agent_ids: Vec<String>,
+    #[serde(default = "default_review_rounds")]
+    max_review_rounds: u32,
+}
+
+fn default_review_rounds() -> u32 {
+    2
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowIdArguments {
+    workflow_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowAcceptArguments {
+    workflow_id: String,
+    controller_id: String,
+    approved: bool,
+    #[serde(default)]
+    notes: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowCancelArguments {
+    workflow_id: String,
+    controller_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowResolveConflictArguments {
+    workflow_id: String,
+    controller_id: String,
+    file: String,
+    choice: String,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowEventsArguments {
+    workflow_id: String,
+    #[serde(default)]
+    after_seq: u64,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 fn delegation_request(store: &Store, name: &str, arguments: Value) -> anyhow::Result<TaskRequest> {
     if name == "delegate_task" {
         let arguments: DelegateArguments =
@@ -283,6 +355,8 @@ fn delegation_request(store: &Store, name: &str, arguments: Value) -> anyhow::Re
         "delegate_to_deepseek" => "deepseek",
         "delegate_to_claude_code" => "claude",
         "delegate_to_codex" => "codex",
+        "delegate_to_workbuddy" => "workbuddy",
+        "delegate_to_trae" => "trae",
         _ => anyhow::bail!("未知委派工具"),
     };
     let arguments: FixedDelegateArguments = serde_json::from_value(arguments)
@@ -337,8 +411,9 @@ fn wait_snapshot(task: TaskRecord, timed_out: bool) -> Value {
     let pending = !is_terminal(&task.status);
     let succeeded = task.status == "completed";
     let queued = task.status == "queued";
+    let handed_off = task.status == "handed_off";
     json!({"taskId": task.id, "task": task, "pending": pending, "timedOut": timed_out && pending, "succeeded": succeeded,
-        "next": if queued { "任务仍在排队，轮到后自动启动（见 task.progress）。继续独立工作或稍后用同一 taskId 调用 wait_task/get_task；不要重发任务。" } else if pending { "任务仍在运行。继续独立工作或稍后用同一 taskId 调用 wait_task/get_task；不要重发任务。" } else if succeeded { "任务已完成，将答案带回当前对话。" } else { "任务未成功完成，向用户如实汇报 task.status 和 task.error，不要自动重发或报告成功。" }})
+        "next": if queued { "任务仍在排队，轮到后自动启动（见 task.progress）。继续独立工作或稍后用同一 taskId 调用 wait_task/get_task；不要重发任务。" } else if pending { "任务仍在运行。继续独立工作或稍后用同一 taskId 调用 wait_task/get_task；不要重发任务。" } else if succeeded { "任务已完成，将答案带回当前对话。" } else if handed_off { "Trae 窗口已交付，但最终答复未自动确认；如实告知用户并请其检查 Trae 窗口，不要报告成功或自动重发。" } else { "任务未成功完成，向用户如实汇报 task.status 和 task.error，不要自动重发或报告成功。" }})
 }
 
 async fn wait_task(store: &Store, arguments: Value) -> anyhow::Result<Value> {
@@ -383,11 +458,104 @@ fn call_tool(store: &Store, name: &str, arguments: Value) -> anyhow::Result<Valu
         "delegate_task"
         | "delegate_to_deepseek"
         | "delegate_to_claude_code"
-        | "delegate_to_codex" => dispatch_task(store, delegation_request(store, name, arguments)?),
+        | "delegate_to_codex"
+        | "delegate_to_workbuddy"
+        | "delegate_to_trae" => dispatch_task(store, delegation_request(store, name, arguments)?),
         "send_task" => {
             let request: TaskRequest =
                 serde_json::from_value(arguments).context("send_task 参数无效")?;
             dispatch_task(store, request)
+        }
+        "sansheng_dispatch" => {
+            let arguments: SanshengDispatchArguments =
+                serde_json::from_value(arguments).context("sansheng_dispatch 参数无效")?;
+            let workflow = pipeline::create_workflow(
+                store,
+                pipeline::NewWorkflow {
+                    objective: arguments.objective,
+                    cwd: arguments.cwd,
+                    planner_agent_id: arguments.planner_agent_id,
+                    reviewer_agent_id: arguments.reviewer_agent_id,
+                    executor_agent_id: arguments.executor_agent_id,
+                    allowed_agent_ids: arguments.allowed_agent_ids,
+                    max_review_rounds: arguments.max_review_rounds,
+                },
+            )?;
+            pipeline::spawn_workflow(store.clone(), workflow.id.clone());
+            Ok(json!({
+                "workflowId": workflow.id,
+                "controllerId": workflow.controller_id,
+                "workflow": workflow,
+                "pending": true,
+                "next": "使用 sansheng_status 查询；只有 phase=awaiting_acceptance 后，由宰相使用 sansheng_accept 做最终验收。不要把已启动当成已完成。"
+            }))
+        }
+        "sansheng_status" => {
+            let arguments: WorkflowIdArguments =
+                serde_json::from_value(arguments).context("sansheng_status 参数无效")?;
+            let workflow = store.workflow(&arguments.workflow_id)?;
+            let tasks = store.workflow_tasks(&arguments.workflow_id)?;
+            Ok(json!({"workflow": workflow, "tasks": tasks}))
+        }
+        "sansheng_events" => {
+            let arguments: WorkflowEventsArguments =
+                serde_json::from_value(arguments).context("sansheng_events 参数无效")?;
+            let events = store.workflow_events(
+                &arguments.workflow_id,
+                arguments.after_seq,
+                arguments.limit.unwrap_or(100),
+            )?;
+            let next_seq = events.last().map(|event| event.seq).unwrap_or(arguments.after_seq);
+            Ok(json!({
+                "protocol": protocol::PROTOCOL_VERSION,
+                "workflowId": arguments.workflow_id,
+                "afterSeq": arguments.after_seq,
+                "nextSeq": next_seq,
+                "events": events,
+            }))
+        }
+        "sansheng_accept" => {
+            let arguments: WorkflowAcceptArguments =
+                serde_json::from_value(arguments).context("sansheng_accept 参数无效")?;
+            let workflow = store.accept_workflow(
+                &arguments.workflow_id,
+                &arguments.controller_id,
+                arguments.approved,
+                &arguments.notes,
+            )?;
+            if workflow.phase == WorkflowPhase::Merging {
+                pipeline::spawn_workflow(store.clone(), workflow.id.clone());
+            }
+            Ok(serde_json::to_value(workflow)?)
+        }
+        "sansheng_cancel" => {
+            let arguments: WorkflowCancelArguments =
+                serde_json::from_value(arguments).context("sansheng_cancel 参数无效")?;
+            Ok(serde_json::to_value(store.cancel_workflow(
+                &arguments.workflow_id,
+                &arguments.controller_id,
+            )?)?)
+        }
+        "sansheng_resolve_conflict" => {
+            let arguments: WorkflowResolveConflictArguments =
+                serde_json::from_value(arguments).context("sansheng_resolve_conflict 参数无效")?;
+            Ok(serde_json::to_value(store.resolve_merge_conflict(
+                &arguments.workflow_id,
+                &arguments.controller_id,
+                &arguments.file,
+                &arguments.choice,
+                arguments.content.as_deref(),
+            )?)?)
+        }
+        "sansheng_retry_merge" => {
+            let arguments: WorkflowCancelArguments =
+                serde_json::from_value(arguments).context("sansheng_retry_merge 参数无效")?;
+            let workflow = store.retry_workflow_merge(
+                &arguments.workflow_id,
+                &arguments.controller_id,
+            )?;
+            pipeline::spawn_workflow(store.clone(), workflow.id.clone());
+            Ok(serde_json::to_value(workflow)?)
         }
         "get_task" => Ok(serde_json::to_value(store.task(required_id(&arguments)?)?)?),
         "wait_task" => {
@@ -430,23 +598,43 @@ fn tool_definitions() -> Vec<Value> {
         "continueTaskId": {"type": ["string", "null"], "description": "可选：继续本工具先前创建的同 Agent、同目录已完成任务"}
     }, "required": ["prompt", "cwd"], "additionalProperties": false});
     let mut delegate_schema = fixed_schema.clone();
-    delegate_schema["properties"]["agentId"] = json!({"type": "string", "enum": ["codex", "deepseek", "claude"], "description": "可选；省略时使用 Codex++ 默认 Agent，明确指定时优先使用该目标"});
+    delegate_schema["properties"]["agentId"] = json!({"type": "string", "enum": ["codex", "deepseek", "claude", "workbuddy", "trae"], "description": "可选；省略时使用 Codex++ 默认 Agent，明确指定时优先使用该目标"});
     let mut send_schema = delegate_schema.clone();
     send_schema["required"] = json!(["agentId", "prompt", "cwd"]);
     let dispatch_annotations =
         json!({"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false});
-    vec![
+    let mut tools = vec![
         json!({"name": "list_agents", "description": "只读：列出默认 Agent、固定 CLI worker 与启用状态。available 只验证本机文件，不代表登录成功；配置在 Codex++ 中管理。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}, "annotations": {"readOnlyHint": true}}),
         json!({"name": "delegate_to_deepseek", "description": "把用户指定的子任务交给 DeepSeek Harness。用户点名 DeepSeek 时使用本工具，固定目标不受默认 Agent 设置影响。异步启动真实外部 CLI，可能编辑 cwd 并消耗账户额度；返回 taskId 后先做独立工作，再 wait_task/get_task 收取结果带回当前对话。不是原生 spawn_agent 子树，不接管已有桌面会话。同一 Agent 可并发执行多个任务（上限按 Agent 配置，默认 1），达到上限时排队、按提交顺序自动启动，排队已满会报错；并发任务请使用不同 cwd 避免互相修改相同文件。失败不自动重发。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
         json!({"name": "delegate_to_claude_code", "description": "把用户指定的子任务交给 Claude Code。用户点名 Claude/Claude Code 时使用本工具，固定目标不受默认 Agent 设置影响。异步启动真实外部 CLI，可能编辑 cwd 并消耗账户额度；返回 taskId 后先做独立工作，再 wait_task/get_task 收取结果带回当前对话。调用的是 Claude Code harness，不是 Claude Desktop 普通 Chat，也不接管已有会话。同一 Agent 可并发执行多个任务（上限按 Agent 配置，默认 1），达到上限时排队、按提交顺序自动启动，排队已满会报错；并发任务请使用不同 cwd 避免互相修改相同文件。失败不自动重发。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
         json!({"name": "delegate_to_codex", "description": "把子任务交给另一个 Codex CLI 会话。用户明确要求另一个 Codex 时使用本工具，固定目标不受默认 Agent 设置影响。可能编辑 cwd 并消耗账户额度；异步返回 taskId 后先做独立工作，再 wait_task/get_task 收结果。不是当前对话原生 spawn_agent 子树，也不接管已有桌面会话。同一 Agent 可并发执行多个任务（上限按 Agent 配置，默认 1），达到上限时排队、按提交顺序自动启动，排队已满会报错；并发任务请使用不同 cwd 避免互相修改相同文件。失败不自动重发。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
+        json!({"name": "delegate_to_workbuddy", "description": "把研究、写作、审阅或第二意见交给无窗口运行的 WorkBuddy。驱动复用本机已登录账号，在隐藏页面新建任务、提交提示词并读取最终答复；不启动可见桌面窗口，也不提供原生会话续聊。返回 taskId 后先做独立工作，再 wait_task/get_task；只有 completed 才表示 WorkBuddy 返回了最终文本。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
+        json!({"name": "delegate_to_trae", "description": "把任务交给无窗口运行的 Trae CN Agent。驱动会按需启动隐藏后台实例、提交到 cwd 对应的工作区，并从本地 CDP 读取最终答复；只有确认完成才返回 completed。超时仍未确认时返回 handed_off，绝不能把 handed_off 当成功。不提供原生会话续聊。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
         json!({"name": "delegate_task", "description": "用户泛指委派给其他 Agent 时使用：省略 agentId 会路由到 Codex++ 配置的默认 Agent，显式 agentId 始终优先。目标未启用或不可用时直接报错，不改派别家。可能编辑 cwd 并消耗原生 CLI 账户额度；异步返回 taskId 后先做独立工作，再 wait_task/get_task 收取终态及答案并带回当前对话。不是原生 spawn_agent 子树，不接管已有桌面会话。", "inputSchema": delegate_schema, "annotations": dispatch_annotations}),
         json!({"name": "send_task", "description": "兼容入口：向显式 agentId 异步派发真实 CLI 任务。可能编辑 cwd 并消耗账户额度；continueTaskId 只续本工具创建的同 Agent、同目录已完成会话。返回 taskId 后先做独立工作，再 wait_task/get_task 收结果；queued 不代表成功；同一 Agent 运行中的任务达到并发上限时排队，失败不自动重发；并发任务请使用不同 cwd。不唤醒已有桌面会话。", "inputSchema": send_schema, "annotations": dispatch_annotations}),
-        json!({"name": "wait_task", "description": "只读：用 taskId 等待先前委派任务，timeoutMs 为 0..30000，默认最多等待 30 秒；终态立即返回。返回 task、pending、timedOut、succeeded。pending=true 时继续独立工作并稍后查询同一 taskId；只有 task.status=completed 才成功，failed/cancelled/interrupted 必须如实报告，绝不因此自动重发。", "inputSchema": {"type": "object", "properties": {"taskId": {"type": "string"}, "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 30000}}, "required": ["taskId"], "additionalProperties": false}, "annotations": {"readOnlyHint": true}}),
-        json!({"name": "get_task", "description": "只读：立即查询任务持久化状态与输出。completed/failed/cancelled/interrupted 为终态；只有 completed 代表成功，interrupted 表示结果不确定，不应自动重发。把子任务结果带回当前对话。", "inputSchema": id_schema, "annotations": {"readOnlyHint": true}}),
+        json!({"name": "wait_task", "description": "只读：用 taskId 等待先前委派任务，timeoutMs 为 0..30000，默认最多等待 30 秒；终态立即返回。返回 task、pending、timedOut、succeeded。pending=true 时继续独立工作并稍后查询同一 taskId；只有 task.status=completed 才成功，failed/cancelled/interrupted 必须如实报告，handed_off 表示 Trae 已交付但未确认结果，也绝不能报告成功或自动重发。", "inputSchema": {"type": "object", "properties": {"taskId": {"type": "string"}, "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 30000}}, "required": ["taskId"], "additionalProperties": false}, "annotations": {"readOnlyHint": true}}),
+        json!({"name": "get_task", "description": "只读：立即查询任务持久化状态与输出。completed/failed/cancelled/interrupted/handed_off 为终态；只有 completed 代表成功，handed_off 表示 Trae 已交付但未确认结果，interrupted 表示结果不确定，均不应自动重发。把子任务结果带回当前对话。", "inputSchema": id_schema, "annotations": {"readOnlyHint": true}}),
         json!({"name": "list_tasks", "description": "只读：活跃任务优先，随后列出最近的持久化协作任务，最多 50 条；不会启动 Agent。", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}}, "additionalProperties": false}, "annotations": {"readOnlyHint": true}}),
         json!({"name": "cancel_task", "description": "请求停止指定任务。排队任务立即取消并移出队列；运行任务等待 worker 停止 CLI 后结束。取消不会回滚已经发生的文件或外部操作。", "inputSchema": id_schema, "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true}}),
-    ]
+    ];
+    tools.extend([
+        json!({"name": "sansheng_dispatch", "description": "启动一个自动三省工作流。root 指定不同源的规划与独立审核 agent；流程自动规划、审核、执行、结果复核，最终停在 awaiting_acceptance，等待 root 最终验收。复杂任务使用本工具；简单任务不要强制走此流程。", "inputSchema": {"type": "object", "properties": {
+            "objective": {"type": "string", "maxLength": 16384},
+            "cwd": {"type": "string"},
+            "plannerAgentId": {"type": "string", "enum": ["codex", "deepseek", "claude", "workbuddy", "trae"]},
+            "reviewerAgentId": {"type": "string", "enum": ["codex", "deepseek", "claude", "workbuddy", "trae"]},
+            "executorAgentId": {"type": "string", "enum": ["codex", "deepseek", "claude", "workbuddy", "trae"]},
+            "allowedAgentIds": {"type": "array", "items": {"type": "string", "enum": ["codex", "deepseek", "claude", "workbuddy", "trae"]}, "maxItems": 5},
+            "maxReviewRounds": {"type": "integer", "minimum": 1, "maximum": 2, "default": 2}
+        }, "required": ["objective", "cwd", "plannerAgentId", "reviewerAgentId", "executorAgentId"], "additionalProperties": false}, "annotations": dispatch_annotations}),
+        json!({"name": "sansheng_status", "description": "只读查询三省工作流阶段、规划、审核意见以及所有子任务。phase=awaiting_acceptance 表示等待宰相最终验收，不等于完成。", "inputSchema": {"type": "object", "properties": {"workflowId": {"type": "string"}}, "required": ["workflowId"], "additionalProperties": false}, "annotations": {"readOnlyHint": true}}),
+        json!({"name": "sansheng_events", "description": "只读：按 afterSeq 游标增量读取三省工作流事件流，协议版本 sansheng.orchestration.v1。", "inputSchema": {"type": "object", "properties": {"workflowId": {"type": "string"}, "afterSeq": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}}, "required": ["workflowId"], "additionalProperties": false}, "annotations": {"readOnlyHint": true}}),
+        json!({"name": "sansheng_accept", "description": "宰相最终验收。只有工作流处于 awaiting_acceptance 且 controllerId 匹配时才能批准或驳回；批准后若无自动合并则 phase=completed，若存在 mergeMode=auto 则先进入 merging，合并成功后 completed，冲突时停在 merge_conflict 且主分支保持不动。", "inputSchema": {"type": "object", "properties": {"workflowId": {"type": "string"}, "controllerId": {"type": "string"}, "approved": {"type": "boolean"}, "notes": {"type": "string", "maxLength": 16384}}, "required": ["workflowId", "controllerId", "approved"], "additionalProperties": false}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false}}),
+        json!({"name": "sansheng_cancel", "description": "取消三省工作流并级联取消未完成的规划、审核、执行或修复任务。必须提供 dispatch 返回的 controllerId。", "inputSchema": {"type": "object", "properties": {"workflowId": {"type": "string"}, "controllerId": {"type": "string"}}, "required": ["workflowId", "controllerId"], "additionalProperties": false}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false}}),
+        json!({"name": "sansheng_resolve_conflict", "description": "在 merge_conflict 状态下逐文件记录冲突决定。choice=ours 保留当前集成版本；choice=theirs 采用当前任务版本；choice=custom 使用 content 作为手工合并结果。全部冲突文件选择后再调用 sansheng_retry_merge；主分支在合并成功前保持不变。", "inputSchema": {"type": "object", "properties": {"workflowId": {"type": "string"}, "controllerId": {"type": "string"}, "file": {"type": "string", "minLength": 1}, "choice": {"type": "string", "enum": ["ours", "theirs", "custom"]}, "content": {"type": "string", "maxLength": 524288, "description": "choice=custom 时的最终 UTF-8 文件内容"}}, "required": ["workflowId", "controllerId", "file", "choice"], "additionalProperties": false}, "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true}}),
+        json!({"name": "sansheng_retry_merge", "description": "在 merge_conflict 状态下，用户修正对应 worktree 分支后重新执行自动合并。主分支在成功前保持不变。", "inputSchema": {"type": "object", "properties": {"workflowId": {"type": "string"}, "controllerId": {"type": "string"}}, "required": ["workflowId", "controllerId"], "additionalProperties": false}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false}}),
+    ]);
+    tools
 }
 
 #[cfg(test)]
@@ -470,6 +658,22 @@ mod tests {
         (directory, store)
     }
 
+    #[test]
+    fn conflict_resolution_schema_supports_custom_content() {
+        let tool = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "sansheng_resolve_conflict")
+            .unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["choice"]["enum"],
+            json!(["ours", "theirs", "custom"])
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["content"]["maxLength"],
+            524288
+        );
+    }
+
     fn delegate_arguments(directory: &tempfile::TempDir) -> Value {
         json!({"prompt": "检查给定实现并返回结论", "cwd": directory.path().to_str().unwrap()})
     }
@@ -481,6 +685,8 @@ mod tests {
             ("delegate_to_deepseek", "deepseek"),
             ("delegate_to_claude_code", "claude"),
             ("delegate_to_codex", "codex"),
+            ("delegate_to_workbuddy", "workbuddy"),
+            ("delegate_to_trae", "trae"),
         ] {
             let mut config = store.config().unwrap();
             config.default_agent_id = if expected == "codex" {
@@ -614,6 +820,9 @@ mod tests {
         let instructions = response["result"]["instructions"].as_str().unwrap();
         assert!(instructions.contains("delegate_to_deepseek"));
         assert!(instructions.contains("delegate_to_claude_code"));
+        assert!(instructions.contains("delegate_to_workbuddy"));
+        assert!(instructions.contains("delegate_to_trae"));
+        assert!(instructions.contains("handed_off"));
         assert!(instructions.contains("wait_task"));
         assert!(instructions.contains("task.status=completed"));
         assert!(instructions.contains("不是原生 spawn_agent"));

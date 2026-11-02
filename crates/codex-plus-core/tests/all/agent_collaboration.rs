@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use codex_plus_core::agent_collaboration::{CollaborationConfig, Store, TaskRequest, mcp};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 
 fn store(temp: &tempfile::TempDir) -> Store {
@@ -88,7 +89,70 @@ fn legacy_configuration_gets_a_default_without_enabling_workers_or_changing_mode
     let mut invalid = config.clone();
     invalid.agents[1].model = "missing-provider".to_string();
     assert!(store.save_config(invalid).is_err());
-    assert_eq!(store.config().unwrap(), config);
+    let saved = store.config().unwrap();
+    assert_eq!(saved.enabled, config.enabled);
+    assert_eq!(saved.agents.len(), 5);
+    for legacy in &config.agents {
+        assert_eq!(
+            saved
+                .agents
+                .iter()
+                .find(|agent| agent.id == legacy.id)
+                .unwrap(),
+            legacy
+        );
+    }
+    for id in ["workbuddy", "trae"] {
+        let added = saved.agents.iter().find(|agent| agent.id == id).unwrap();
+        assert!(!added.enabled);
+        assert!(added.executable.is_empty());
+        assert!(added.model.is_empty());
+    }
+}
+
+#[test]
+fn legacy_snapshot_exposes_new_adapters_before_the_next_save() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    let connection = Connection::open(store.path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE collaboration_state (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 payload TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    let payload = json!({
+        "config": {
+            "enabled": true,
+            "defaultAgentId": "deepseek",
+            "agents": [
+                {"id":"codex","name":"Codex","executable":"","enabled":false,"model":""},
+                {"id":"deepseek","name":"DeepSeek Harness","executable":"","enabled":false,"model":""},
+                {"id":"claude","name":"Claude Code","executable":"","enabled":false,"model":""}
+            ],
+            "maxRuntimeMinutes": 10
+        },
+        "tasks": []
+    });
+    connection
+        .execute(
+            "INSERT INTO collaboration_state(id, payload) VALUES(1, ?1)",
+            [payload.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let snapshot = store.snapshot().unwrap();
+    let agents = snapshot["config"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 5);
+    for id in ["workbuddy", "trae"] {
+        let agent = agents.iter().find(|agent| agent["id"] == id).unwrap();
+        assert_eq!(agent["enabled"], false);
+        assert_eq!(agent["executable"], "");
+        assert_eq!(agent["model"], "");
+    }
 }
 
 #[test]
@@ -431,12 +495,21 @@ fn mcp_protocol_keeps_errors_per_request_and_never_exposes_configuration_mutatio
             "delegate_to_deepseek",
             "delegate_to_claude_code",
             "delegate_to_codex",
+            "delegate_to_workbuddy",
+            "delegate_to_trae",
             "delegate_task",
             "send_task",
             "wait_task",
             "get_task",
             "list_tasks",
-            "cancel_task"
+            "cancel_task",
+            "sansheng_dispatch",
+            "sansheng_status",
+            "sansheng_events",
+            "sansheng_accept",
+            "sansheng_cancel",
+            "sansheng_resolve_conflict",
+            "sansheng_retry_merge"
         ]
     );
     let rejected = mcp::handle_request(&store, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send_task","arguments":request(&temp,"codex")}})).unwrap();

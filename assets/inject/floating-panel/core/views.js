@@ -160,8 +160,12 @@
       const blocked = state.outlineStatus === "pending";
       return { blocked, title: blocked ? "正在整理大纲" : "刷新大纲" };
     }
-    const blocked = state.bridgeStatus === "pending" || chatBusy();
-    return { blocked, title: blocked ? "等待回答完成" : "刷新建议" };
+    const unconfigured = !stepwiseConfigurationReady();
+    const blocked = unconfigured || state.bridgeStatus === "pending" || chatBusy();
+    return {
+      blocked,
+      title: unconfigured ? "请先配置服务地址、模型和密钥" : blocked ? "等待回答完成" : "刷新建议",
+    };
   }
 
   function refreshCurrentView() {
@@ -355,6 +359,12 @@
   }
 
   function nextEmptyState() {
+    if (stepwiseEnabled() && !stepwiseConfigurationReady()) {
+      return {
+        title: "等待配置",
+        message: "请先填写服务地址、模型和密钥",
+      };
+    }
     if (state.bridgeError || state.bridgeStatus === "failed") return bridgeErrorPresentation();
     if (state.bridgeStatus === "ok") {
       return {
@@ -665,7 +675,7 @@
             </div>
             <div class="csw-command-deck" aria-label="设置操作">
               ${settingsCommandHtml("open-manager", "open-config", "配置", "在 Codex++ 中配置")}
-              ${settingsCommandHtml("test-settings", testing ? "refresh" : "connection", "检查", "检查连接", { disabled: settings?.enabled !== true, busy: testing })}
+              ${settingsCommandHtml("test-settings", testing ? "refresh" : "connection", "检查", "检查连接", { disabled: !stepwiseConfigurationReady(settings), busy: testing })}
             </div>
             ${notice ? `<div class="csw-settings-notice" data-tone="${noticeTone}" aria-live="polite">${escapeHtml(notice)}</div>` : ""}
           </div>

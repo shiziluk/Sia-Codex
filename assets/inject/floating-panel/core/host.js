@@ -2,11 +2,7 @@
 
   // Derived expressions turn backend, parser, and page states into one calm user-facing status.
   function expressionError() {
-    const settings = state.settings;
-    const configurationMissing = settings?.enabled === true
-      && (!settings.baseUrlConfigured || !settings.model || !settings.apiKeyConfigured);
-    return configurationMissing
-      || state.bridgeStatus === "failed"
+    return state.bridgeStatus === "failed"
       || (state.bridgeStatus === "disabled" && Boolean(state.bridgeError))
       || state.scanStatus === "manual-refresh-no-assistant";
   }
@@ -22,6 +18,7 @@
 
   function resolveStepwiseExpression(now = Date.now()) {
     if (!stepwiseEnabled()) return "hidden";
+    if (!stepwiseConfigurationReady()) return "curious";
     if (state.bridgeStatus === "pending") return "generating";
     if (expressionError()) return "error";
     if (stepwiseGenerationMode() === "manual") {

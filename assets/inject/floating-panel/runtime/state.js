@@ -411,6 +411,13 @@
     return settings?.enabled === true && !globalThis.__codexPlusBuiltinInactive?.has("stepwise");
   }
 
+  function stepwiseConfigurationReady(settings = state.settings) {
+    return stepwiseEnabled(settings)
+      && settings?.baseUrlConfigured === true
+      && Boolean(settings?.model)
+      && settings?.apiKeyConfigured === true;
+  }
+
   function normalizeGenerationMode(value) {
     return value === "manual" ? "manual" : "auto";
   }
