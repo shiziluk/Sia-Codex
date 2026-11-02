@@ -1,83 +1,70 @@
-name: Bug 报告
-description: 程序崩溃、报错、配置写入异常、功能行为不符合预期。
+name: Bug report
+description: Report a reproducible problem in Sia-Codex.
 title: "[Bug]: "
+labels:
+  - bug
 body:
   - type: markdown
     attributes:
       value: |
-        请尽量填写可复现的信息。涉及 API Key、Token、账号、Base URL 时请先脱敏。
+        Do not post API keys, cookies, tokens, account names, private paths, or full logs containing personal data.
+        Remove secrets before attaching diagnostics.
   - type: dropdown
-    id: area
+    id: component
     attributes:
-      label: 影响范围
+      label: Component
       options:
-        - 启动 / 重启 Codex++
-        - 供应商切换 / 配置写入
-        - 协议转换 / 代理
-        - MCP / skills / plugins
-        - 模型列表 / model_catalog_json
-        - 界面 / 交互
-        - 构建 / 安装
-        - 其他
+        - Sansheng orchestration
+        - Manager UI
+        - Native browser enhancement
+        - Agent adapters
+        - Build or packaging
+        - Other
     validations:
       required: true
-  - type: textarea
-    id: current_behavior
-    attributes:
-      label: 当前行为
-      description: 实际发生了什么？如果有报错，请贴完整错误文本。
-      placeholder: 点击重启 Codex++ 后没有启动，latest-status.json 显示...
-    validations:
-      required: true
-  - type: textarea
-    id: expected_behavior
-    attributes:
-      label: 预期行为
-      placeholder: 应该同步当前供应商配置并启动 Codex。
-    validations:
-      required: true
-  - type: textarea
-    id: reproduce
-    attributes:
-      label: 复现步骤
-      placeholder: |
-        1. 打开...
-        2. 选择...
-        3. 点击...
-        4. 看到...
-    validations:
-      required: true
-  - type: textarea
-    id: logs
-    attributes:
-      label: 日志 / 配置片段
-      description: 请删除或替换 API Key、Token、账号等敏感信息。
-      render: shell
   - type: input
-    id: version
+    id: revision
     attributes:
-      label: Codex++ 版本
-      placeholder: 例如 1.1.8
+      label: Sia-Codex revision
+      description: Commit hash or release name.
+      placeholder: 12a21e9
     validations:
       required: true
-  - type: dropdown
-    id: os
+  - type: input
+    id: environment
     attributes:
-      label: 系统
-      options:
-        - Windows
-        - macOS
-        - Linux
-        - 其他
+      label: Environment
+      description: OS version and relevant Codex/CLI version.
     validations:
       required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open ...
+        2. Configure ...
+        3. Run ...
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Optional. Remove credentials, account identifiers, and private filesystem paths.
   - type: checkboxes
-    id: checklist
+    id: safety
     attributes:
-      label: 提交前确认
+      label: Safety check
       options:
-        - label: 我已经脱敏了 API Key、Token、账号等敏感信息。
+        - label: I removed secrets, credentials, account identifiers, and private data from this report.
           required: true
-        - label: 我已经确认这是当前最新版仍然存在的问题。
-          required: false
-
+        - label: I understand this is an unofficial downstream project, not the upstream CodexPlusPlus release.
+          required: true

@@ -13,19 +13,38 @@
 > `59bdcf1c020fa8f561e9607ee99d0e85d73b52e8`），并按 AGPL-3.0-only 分发。
 > 来源、修改范围与商标边界见 [FORK-NOTICE.md](FORK-NOTICE.md)。
 
+## Sia-Codex 版本说明
+
+Sia-Codex 在原版 Codex++ 的基础上重点维护三省六部式多 Agent 编排：
+
+- 中书规划、门下独立审核、六部执行、结果复核和宰相最终验收。
+- 依赖感知的并行调度、Git worktree 隔离与自动合并。
+- 三版本冲突预览、手工最终内容、冲突重试和清理。
+- 游标事件接口、本机回环 SSE，以及可视 DAG 状态画布。
+- 上游更新只提示，不自动下载或覆盖下游构建。
+
+构建与下游维护方式见 [docs/LOCAL-DOWNSTREAM.md](docs/LOCAL-DOWNSTREAM.md)，
+三省协议见 [docs/sansheng-orchestration-protocol-v1.md](docs/sansheng-orchestration-protocol-v1.md)。
+
+> [!WARNING]
+> 当前 `@oai/browser-desktop@0.1.1` 使用新版 managed request headers
+> 协议，尚未适配本分支的 native-browser identification enhancement。可运行
+> `npm.cmd run test:native-browser-local --prefix apps/codex-plus-manager`
+> 检查本机兼容性；不兼容时不要对该运行时启用此增强。
+
 <p align="center">
   <a href="https://github.com/BigPizzaV3/CodexPlusPlus/releases"><img src="https://img.shields.io/github/v/release/BigPizzaV3/CodexPlusPlus?style=flat-square&amp;color=7387ff&amp;label=release" alt="最新版本"></a>
-  <a href="https://github.com/BigPizzaV3/CodexPlusPlus/stargazers"><img src="https://img.shields.io/github/stars/BigPizzaV3/CodexPlusPlus?style=flat-square&amp;color=e8b86d" alt="GitHub Stars"></a>
+  <a href="https://github.com/shiziluk/Sia-Codex/stargazers"><img src="https://img.shields.io/github/stars/shiziluk/Sia-Codex?style=flat-square&amp;color=e8b86d" alt="GitHub Stars"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-838da8?style=flat-square" alt="许可证 AGPL-3.0-only"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-838da8?style=flat-square" alt="支持 Windows 和 macOS">
   <img src="https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-838da8?style=flat-square" alt="使用 Rust 与 Tauri 构建">
 </p>
 
 <p align="center">
-  <a href="https://github.com/BigPizzaV3/CodexPlusPlus/releases"><strong>下载最新版 ↗</strong></a> &nbsp; · &nbsp;
+  <a href="#sia-codex-版本说明"><strong>Sia-Codex 版本说明</strong></a> &nbsp; · &nbsp;
   <a href="#快速上手">快速上手</a> &nbsp; · &nbsp;
   <a href="#功能一览">功能一览</a> &nbsp; · &nbsp;
-  <a href="https://github.com/BigPizzaV3/CodexPlusPlus/issues">反馈问题</a> &nbsp; · &nbsp;
+  <a href="https://github.com/shiziluk/Sia-Codex/issues">反馈问题</a> &nbsp; · &nbsp;
   <a href="README_EN.md">English</a>
 </p>
 
@@ -38,7 +57,7 @@ Codex++ 是 AI 编程 Agent 的统一管理应用。它从 OpenAI Codex / ChatGP
 
 ## 交流与支持
 
-遇到问题请通过 [GitHub Issues](https://github.com/BigPizzaV3/CodexPlusPlus/issues) 提交，附上系统、Codex++ 版本、复现步骤与已脱敏的日志。欢迎分享拓展、主题和使用经验。
+遇到问题请通过 [Sia-Codex Issues](https://github.com/shiziluk/Sia-Codex/issues) 提交，附上系统、版本或提交号、复现步骤与已脱敏的日志。不要提交 API Key、登录 Cookie、账号标识或本机私人路径。
 
 <p align="center">
   <a href="https://qm.qq.com/q/5h3pxpxg7S">QQ 交流 4 群 · 1127858981</a> &nbsp; · &nbsp;
@@ -132,7 +151,8 @@ Codex++ 是 AI 编程 Agent 的统一管理应用。它从 OpenAI Codex / ChatGP
   </tr>
 </table>
 
-想支持项目或展示品牌？[联系维护者](mailto:1727532@qq.com)。
+上游原项目赞助与品牌展示请[联系上游维护者](mailto:1727532@qq.com)；
+Sia-Codex 的下游功能问题请使用本仓库 Issues。
 
 ## 功能一览
 
@@ -408,8 +428,8 @@ cargo build --release
 
 <p align="center">
   <img src="docs/images/codex-plus-plus.png" alt="Codex++ 项目标志" width="44"><br>
-  <strong>Codex++</strong> · 让 AI 编程 Agent 更顺手。<br>
-  <sub>Copyright © 2026 BigPizzaV3 · <a href="LICENSE">AGPL-3.0-only</a></sub>
+  <strong>Sia-Codex</strong> · CodexPlusPlus 非官方下游版本<br>
+  <sub>Upstream © 2026 BigPizzaV3 · downstream maintenance by shiziluk · <a href="LICENSE">AGPL-3.0-only</a></sub>
 </p>
 
 CodexPlusPlus 的修改与分发、通过网络提供修改后版本的源代码义务，以 [GNU AGPL v3.0](LICENSE) 为准。许可证覆盖本项目自身代码，第三方素材遵循各自声明；不授予 OpenAI、ChatGPT、Codex、Anthropic、Claude、xAI、Grok 等商标或应用资源的权利。
