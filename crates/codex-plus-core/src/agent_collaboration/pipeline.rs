@@ -1436,7 +1436,7 @@ mod tests {
     fn prompts_use_portable_paths() {
         assert_eq!(
             normalize_prompt_path(r"\\?\D:\workspace\autotest"),
-            "D:/dev-tools/autotest"
+            "D:/workspace/autotest"
         );
         assert_eq!(
             normalize_prompt_path(r"\\?\UNC\server\share"),
