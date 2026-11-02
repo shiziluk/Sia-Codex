@@ -44,13 +44,40 @@ pub const BROWSER_SERVER_ID: &str = "codex-plus-browser";
 pub const CODEX_SERVER_ID: &str = "codex_plus_cu";
 const CODEX_NOT_INSTALLABLE: &str =
     "Codex 自带 Computer Use，不接入 Codex++ 的：同时存在会出现两套电脑控制工具";
-/// 非 macOS 平台的明确提示：运行时只随 macOS 版 ChatGPT.app 提供，别的平台不是「没装」而是「不支持」。
-pub const UNSUPPORTED_PLATFORM: &str =
-    "Computer Use 接入目前只支持 macOS，暂不支持 Windows：它依赖 macOS 版 ChatGPT.app 自带的 Computer Use 服务";
+/// 不支持平台的明确提示。
+pub const UNSUPPORTED_PLATFORM: &str = "Computer Use 接入目前只支持 macOS 与 Windows";
 
 /// 当前平台能否接入 Computer Use。
 pub fn platform_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
+/// Windows 当前只提供 `cua_repl` 的 JS 操作面；原生离散工具只随 macOS app 提供。
+pub fn tools_mode_supported() -> bool {
     cfg!(target_os = "macos")
+}
+
+/// 悬浮预览依赖 macOS WindowServer；Windows 仍可使用客户端自带截图。
+pub fn pip_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn platform_target() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "mac"
+    } else {
+        "unknown"
+    }
+}
+
+fn runtime_missing_detail() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "未找到 Codex 的 Windows Computer Use 运行时，请先打开一次 Codex 的 Computer Use 完成下载"
+    } else {
+        "未找到 Codex 运行时（ChatGPT.app）"
+    }
 }
 
 const MAX_CONFIG_BYTES: u64 = 8 * 1024 * 1024;
@@ -179,7 +206,7 @@ fn workbuddy_config_dir() -> PathBuf {
 }
 
 /// 拉起原生 CU server 时从当前环境透传的变量，与 Codex 的 `DEFAULT_ENV_VARS`（Unix）一致。
-const NATIVE_ENV_PASSTHROUGH: [&str; 11] = [
+const NATIVE_ENV_PASSTHROUGH: [&str; 20] = [
     "HOME",
     "LOGNAME",
     "PATH",
@@ -191,6 +218,15 @@ const NATIVE_ENV_PASSTHROUGH: [&str; 11] = [
     "TERM",
     "TMPDIR",
     "TZ",
+    "SYSTEMROOT",
+    "WINDIR",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "COMSPEC",
+    "PATHEXT",
 ];
 
 /// 代理变量。浏览器面打开新网站前要联网做一次安全检查（Codex 里借道应用自己的通道，
@@ -312,7 +348,12 @@ impl RuntimeLocation {
         );
         env.insert(
             "NODE_REPL_TRUSTED_CODE_PATHS".into(),
-            format!("{}:{}", self.codex_home, self.node_module_dirs),
+            format!(
+                "{}{}{}",
+                self.codex_home,
+                if cfg!(windows) { ';' } else { ':' },
+                self.node_module_dirs
+            ),
         );
         env.insert("CODEX_HOME".into(), self.codex_home.clone());
         env.insert("CUA_REPL_NODE_REPL_PATH".into(), self.node_repl.clone());
@@ -341,7 +382,11 @@ impl RuntimeLocation {
         }
         env.insert(
             "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE".into(),
-            "Control desktop apps on macOS through Computer Use.".into(),
+            if cfg!(windows) {
+                "Control desktop apps on Windows through Computer Use.".into()
+            } else {
+                "Control desktop apps on macOS through Computer Use.".into()
+            },
         );
         env
     }
@@ -394,7 +439,9 @@ impl RuntimeLocation {
             }
         }
         env.insert("CODEX_HOME".into(), self.codex_home.clone());
-        if let Some(cli) = &self.codex_cli {
+        if let Some(cli) = &self.codex_cli
+            && !cfg!(windows)
+        {
             env.insert("CODEX_CLI_PATH".into(), cli.clone());
         }
         env.extend(proxy_env());
@@ -542,6 +589,21 @@ pub struct HealthReport {
 /// 找本机的 Codex CU 运行时。找不到就返回 `Ok(None)`，由调用方决定怎么提示。
 pub fn locate_runtime() -> anyhow::Result<Option<RuntimeLocation>> {
     let codex_home = crate::codex_home::default_codex_home_dir();
+    #[cfg(target_os = "windows")]
+    {
+        let root = directories::BaseDirs::new()
+            .map(|dirs| dirs.data_local_dir().join("OpenAI/Codex/runtimes/cua_node"))
+            .context("无法定位 Windows Codex 运行目录")?;
+        return locate_windows_runtime_at(&root, &codex_home);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        locate_macos_runtime(&codex_home)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn locate_macos_runtime(codex_home: &Path) -> anyhow::Result<Option<RuntimeLocation>> {
     // 原生 CU server 由 Codex 的安装器放在 codex home 下，不随 app 走。
     let client = codex_home
         .join("computer-use/Codex Computer Use.app")
@@ -587,6 +649,93 @@ pub fn locate_runtime() -> anyhow::Result<Option<RuntimeLocation>> {
         }));
     }
     Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+fn locate_windows_runtime_at(
+    root: &Path,
+    codex_home: &Path,
+) -> anyhow::Result<Option<RuntimeLocation>> {
+    let mut runtimes = Vec::new();
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("无法读取 Windows Codex 运行目录"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() != 16 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let manifest = path.join("manifest.json");
+        let node = path.join("bin/node.exe");
+        let node_repl = path.join("bin/node_repl.exe");
+        let cua_repl = path.join("bin/node_modules/@oai/cua-repl/bin/cua-repl.mjs");
+        let cua_package = path.join("bin/node_modules/@oai/cua-repl/package.json");
+        let sky_helper = path.join("bin/node_modules/@oai/sky/bin/windows/codex-computer-use.exe");
+        if !(manifest.is_file()
+            && node.is_file()
+            && node_repl.is_file()
+            && cua_repl.is_file()
+            && cua_package.is_file()
+            && sky_helper.is_file())
+        {
+            continue;
+        }
+        let manifest_text = fs::read_to_string(&manifest)?;
+        let manifest_value: Value = serde_json::from_str(&manifest_text)
+            .with_context(|| format!("无效的 Computer Use manifest：{}", manifest.display()))?;
+        if manifest_value["platform"] != "windows"
+            || manifest_value["arch"] != "x64"
+            || manifest_value["target"] != "windows-x64"
+        {
+            continue;
+        }
+        let modified = fs::metadata(&manifest)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        runtimes.push((modified, path, manifest_value));
+    }
+    runtimes.sort_by(|left, right| right.0.cmp(&left.0));
+    let Some((_, runtime, manifest)) = runtimes.into_iter().next() else {
+        return Ok(None);
+    };
+    let module_dirs = runtime.join("bin/node_modules");
+    let package_version = read_package_version(&module_dirs.join("@oai/cua-repl/package.json"));
+    let app_version = manifest["runtime_archive_version"]
+        .as_str()
+        .and_then(|value| value.split('/').next())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| manifest["node_version"].as_str().map(str::to_string));
+    Ok(Some(RuntimeLocation {
+        app_path: runtime.to_string_lossy().into_owned(),
+        node: runtime.join("bin/node.exe").to_string_lossy().into_owned(),
+        client: String::new(),
+        cua_repl: runtime
+            .join("bin/node_modules/@oai/cua-repl/bin/cua-repl.mjs")
+            .to_string_lossy()
+            .into_owned(),
+        node_repl: runtime
+            .join("bin/node_repl.exe")
+            .to_string_lossy()
+            .into_owned(),
+        node_module_dirs: module_dirs.to_string_lossy().into_owned(),
+        codex_home: codex_home.to_string_lossy().into_owned(),
+        service_path: None,
+        // Windows 的 node_repl 若带 CODEX_CLI_PATH 会进入 sandbox，进而阻止
+        // @oai/sky 启动签名的 codex-computer-use.exe。外部 MCP 的审批由本代理转交客户端，
+        // 因此这里故意不以 app-server 作为 sandbox 父进程。
+        codex_cli: None,
+        app_version,
+        package_version,
+    }))
 }
 
 /// 把内嵌的 shim 写到 state 目录，返回它的绝对路径。
@@ -983,7 +1132,7 @@ pub fn install_custom(id: &str) -> anyhow::Result<InstallReceipt> {
     let target = custom_target(id)?;
     ensure!(platform_supported(), "{UNSUPPORTED_PLATFORM}");
     let runtime =
-        locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），无法接入 Computer Use")?;
+        locate_runtime()?.context(runtime_missing_detail())?;
     let file = target.config_path();
     if let Some(dir) = file.parent() {
         ensure!(dir.is_dir(), "目录不存在：{}", dir.display());
@@ -1034,7 +1183,7 @@ pub fn status() -> anyhow::Result<StatusReport> {
         service_path: runtime.as_ref().and_then(|item| item.service_path.clone()),
         config_hint: runtime.is_none().then(|| {
             if platform_supported() {
-                "未找到 ChatGPT.app：请先安装 Codex 桌面版，或把应用放进 /Applications".to_string()
+                runtime_missing_detail().to_string()
             } else {
                 UNSUPPORTED_PLATFORM.to_string()
             }
@@ -1114,7 +1263,7 @@ fn status_at(
         message,
     };
     let Some(runtime) = runtime else {
-        return unsupported("未找到 Codex 运行时（ChatGPT.app）".into());
+        return unsupported(runtime_missing_detail().into());
     };
     if let Some(message) = home_missing {
         return unsupported(message);
@@ -1224,7 +1373,7 @@ pub fn install(target: Target) -> anyhow::Result<InstallReceipt> {
     ensure!(target != Target::Codex, "{CODEX_NOT_INSTALLABLE}");
     ensure!(platform_supported(), "{UNSUPPORTED_PLATFORM}");
     let runtime =
-        locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），无法接入 Computer Use")?;
+        locate_runtime()?.context(runtime_missing_detail())?;
     if let Some(message) = target.tool_home_missing() {
         bail!("{message}");
     }
@@ -1452,7 +1601,7 @@ pub fn check() -> HealthReport {
                 sample_apps: vec![],
                 duration_ms: elapsed_ms(started),
                 failure_kind: Some("runtime_missing".into()),
-                failure_detail: Some("未找到 ChatGPT.app 及其 cua_node 运行时".into()),
+                failure_detail: Some(runtime_missing_detail().into()),
             };
         }
         Err(error) => {
@@ -1687,7 +1836,7 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
                 kill_tree(&mut child);
                 return HealthReport {
                     ok: true,
-                    target: "mac".into(),
+                    target: platform_target().into(),
                     app_count: Some(count),
                     // 原生 CU server 没有浏览器面，浏览器能力由独立 server 提供。
                     browser_count: None,
@@ -1736,7 +1885,7 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
 fn probe_failure(kind: &str, detail: &str) -> HealthReport {
     HealthReport {
         ok: false,
-        target: "mac".into(),
+        target: platform_target().into(),
         app_count: None,
         browser_count: None,
         sample_apps: vec![],
@@ -2092,14 +2241,19 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn non_macos_reports_unsupported_instead_of_missing_runtime() {
-        assert_eq!(platform_supported(), cfg!(target_os = "macos"));
+    fn platform_and_mode_support_are_reported_explicitly() {
+        assert_eq!(
+            platform_supported(),
+            cfg!(any(target_os = "macos", target_os = "windows"))
+        );
+        assert_eq!(tools_mode_supported(), cfg!(target_os = "macos"));
+        assert_eq!(pip_supported(), cfg!(target_os = "macos"));
         let report = unsupported_platform_report(0);
         assert!(!report.ok);
         assert_eq!(report.failure_kind.as_deref(), Some("unsupported_platform"));
-        assert!(UNSUPPORTED_PLATFORM.contains("暂不支持 Windows"));
+        assert!(UNSUPPORTED_PLATFORM.contains("macOS 与 Windows"));
         if !platform_supported() {
-            // 非 macOS：接入直接给出「不支持」，不再落到「未找到 ChatGPT.app」。
+            // 其它平台：接入直接给出「不支持」，不再落到「未找到运行时」。
             let error = install(Target::ClaudeCode).unwrap_err().to_string();
             assert_eq!(error, UNSUPPORTED_PLATFORM);
             assert_eq!(check().failure_kind.as_deref(), Some("unsupported_platform"));
@@ -2120,6 +2274,57 @@ mod tests {
             app_version: Some("26.1016.61520".into()),
             package_version: Some("0.1.2".into()),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_runtime_uses_cua_repl_without_codex_sandbox_parent() {
+        let temp = TempDir::new().unwrap();
+        let runtime = temp.path().join("0123456789abcdef");
+        let files = [
+            (
+                "manifest.json",
+                r#"{"platform":"windows","arch":"x64","target":"windows-x64","runtime_archive_version":"0.0.35/build","node_version":"24.22.1-cua.1"}"#,
+            ),
+            ("bin/node.exe", "node"),
+            ("bin/node_repl.exe", "repl"),
+            (
+                "bin/node_modules/@oai/cua-repl/bin/cua-repl.mjs",
+                "launcher",
+            ),
+            (
+                "bin/node_modules/@oai/cua-repl/package.json",
+                r#"{"version":"0.1.2"}"#,
+            ),
+            (
+                "bin/node_modules/@oai/sky/bin/windows/codex-computer-use.exe",
+                "helper",
+            ),
+        ];
+        for (path, contents) in files {
+            let path = runtime.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let located = locate_windows_runtime_at(temp.path(), &temp.path().join("home"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(located.package_version.as_deref(), Some("0.1.2"));
+        assert_eq!(located.app_version.as_deref(), Some("0.0.35"));
+        assert_eq!(located.codex_cli, None);
+        assert!(located.cua_repl.ends_with("cua-repl.mjs"));
+        assert!(located.node.ends_with("node.exe"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires the locally installed Windows Codex Computer Use runtime"]
+    fn live_windows_runtime_is_discoverable() {
+        let runtime = locate_runtime().unwrap().expect("Windows runtime");
+        assert!(Path::new(&runtime.node).is_file());
+        assert!(Path::new(&runtime.node_repl).is_file());
+        assert!(Path::new(&runtime.cua_repl).is_file());
+        assert_eq!(runtime.codex_cli, None);
     }
 
     #[test]
@@ -2147,6 +2352,10 @@ mod tests {
         assert_eq!(env["BROWSER_USE_TINYSKY_ENABLED"], "1");
         assert!(env["NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME"].contains("Prefer this method"));
         assert!(env.contains_key("NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE"));
+        if cfg!(windows) {
+            assert!(env["NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE"].contains("Windows"));
+            assert!(env["NODE_REPL_TRUSTED_CODE_PATHS"].contains(';'));
+        }
     }
 
     #[test]
@@ -2157,7 +2366,11 @@ mod tests {
         runtime.service_path = Some("/x/Codex Computer Use.app".into());
         let env = runtime.native_client_env();
 
-        assert_eq!(env["CODEX_CLI_PATH"], "/Applications/ChatGPT.app/codex");
+        if cfg!(windows) {
+            assert!(!env.contains_key("CODEX_CLI_PATH"));
+        } else {
+            assert_eq!(env["CODEX_CLI_PATH"], "/Applications/ChatGPT.app/codex");
+        }
         assert_eq!(env["CODEX_HOME"], runtime.codex_home);
         // 实测没用，不再传。
         assert!(!env.contains_key("SKY_CUA_SERVICE_PATH"));
