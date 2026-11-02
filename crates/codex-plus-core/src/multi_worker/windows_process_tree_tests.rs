@@ -1,6 +1,6 @@
 use super::*;
 use crate::multi_worker::terminate_verified_codex_instance;
-use crate::windows_integration::{CREATE_NO_WINDOW, child_process_birth_id};
+use crate::windows_integration::{child_process_birth_id, CREATE_NO_WINDOW};
 use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -277,10 +277,10 @@ struct FixtureGroup {
 
 impl FixtureGroup {
     fn start(port: u16) -> Self {
-        Self::start_with_paths(port, false)
+        Self::start_with_paths(port, false).expect("fixture should not require short paths")
     }
 
-    fn start_with_paths(port: u16, use_short_paths: bool) -> Self {
+    fn start_with_paths(port: u16, use_short_paths: bool) -> Option<Self> {
         let mut group = Self {
             dir: tempfile::Builder::new()
                 .prefix("Codex process safety fixture ")
@@ -297,10 +297,9 @@ impl FixtureGroup {
         std::fs::copy(&image, dir.join("resources/codex.exe")).unwrap();
         let launch_dir = if use_short_paths {
             let short = short_path(&dir.canonicalize().unwrap());
-            assert!(
-                !same_resolved_path(&short, &dir.canonicalize().unwrap()),
-                "regression requires a real 8.3 alias"
-            );
+            if same_resolved_path(&short, &dir.canonicalize().unwrap()) {
+                return None;
+            }
             short
         } else {
             dir.to_path_buf()
@@ -308,7 +307,7 @@ impl FixtureGroup {
         group.root = Some(spawn_fixture(&launch_dir, "root", port));
         group.neighbor = Some(spawn_fixture(&launch_dir, "neighbor", 0));
         wait_for_fixtures(dir, MODES, Duration::from_secs(10));
-        group
+        Some(group)
     }
 
     fn process(&self, mode: &str) -> VerifiedStopProcess {
@@ -396,7 +395,10 @@ fn unused_port() -> u16 {
 async fn short_path_launch_matches_long_identity_and_preserves_unowned_processes() {
     let _guard = FIXTURE_LOCK.lock().await;
     let port = unused_port();
-    let fixtures = FixtureGroup::start_with_paths(port, true);
+    let Some(fixtures) = FixtureGroup::start_with_paths(port, true) else {
+        eprintln!("skipped: this volume does not provide 8.3 short-path aliases");
+        return;
+    };
     let mut identity = fixtures.identity(port);
     identity.executable = fixtures
         .dir
@@ -422,7 +424,9 @@ async fn short_path_launch_matches_long_identity_and_preserves_unowned_processes
         ),
         Some(Role::AppServer)
     );
-    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap().unwrap();
+    let mut tree = CodexInstanceProcessTree::capture(&identity)
+        .unwrap()
+        .unwrap();
     assert_eq!(tree.processes.len(), 4);
     let owned: Vec<_> = ["root", "renderer", "gpu", "appserver"]
         .iter()
@@ -443,8 +447,12 @@ async fn concurrent_stops_confirm_exit_of_the_same_owned_tree() {
     let port = unused_port();
     let fixtures = FixtureGroup::start(port);
     let identity = fixtures.identity(port);
-    let mut first = CodexInstanceProcessTree::capture(&identity).unwrap().unwrap();
-    let mut second = CodexInstanceProcessTree::capture(&identity).unwrap().unwrap();
+    let mut first = CodexInstanceProcessTree::capture(&identity)
+        .unwrap()
+        .unwrap();
+    let mut second = CodexInstanceProcessTree::capture(&identity)
+        .unwrap()
+        .unwrap();
     let preserved: Vec<_> = ["shell", "independent", "user-tool", "neighbor"]
         .iter()
         .map(|mode| fixtures.process(mode))
@@ -464,7 +472,9 @@ async fn stop_tracking_cleans_owned_orphans_and_preserves_shell_tools_and_neighb
     let port = unused_port();
     let fixtures = FixtureGroup::start(port);
     let identity = fixtures.identity(port);
-    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap().unwrap();
+    let mut tree = CodexInstanceProcessTree::capture(&identity)
+        .unwrap()
+        .unwrap();
     assert_eq!(tree.processes.len(), 4);
     let owned: Vec<_> = ["root", "renderer", "gpu", "appserver"]
         .iter()
@@ -485,7 +495,7 @@ async fn stop_tracking_cleans_owned_orphans_and_preserves_shell_tools_and_neighb
 #[tokio::test]
 async fn wrong_birth_image_arguments_and_browser_conflict_never_stop_the_root() {
     let _fixture_lock = FIXTURE_LOCK.lock().await;
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
     // 专属服务才能通过 drop 模拟端口失联；默认池化服务会继续返回 HTTP 404。
     let server = MockServer::builder().start().await;
     let port = server.address().port();

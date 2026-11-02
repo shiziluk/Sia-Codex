@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readFile } from "node:fs/promises";
 
+Object.defineProperty(globalThis, "navigator", {
+  configurable: true,
+  value: { language: "en-US", languages: ["en-US"] },
+});
+
 describe("session more menu lifecycle", () => {
   async function runtime() {
     const source = await readFile(
