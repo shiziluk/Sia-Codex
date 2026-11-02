@@ -64,3 +64,19 @@ test("agent orchestration page exposes overview and visible task console", () =>
   assert.doesNotMatch(css, /var\(--text-secondary\)/);
   assert.doesNotMatch(css, /background:\s*var\(--surface\)/);
 });
+
+test("worker control center exposes real test actions, status facts, and logs", () => {
+  assert.match(page, /function WorkerCenter/);
+  assert.match(page, /WORKER_OK/);
+  assert.match(page, /WORKER_TASK_OK/);
+  assert.match(page, /测试连接/);
+  assert.match(page, /派一个测试任务/);
+  assert.match(page, /查看日志/);
+  assert.match(page, /最近任务/);
+  assert.match(page, /认证 \/ 额度/);
+  assert.match(page, /worker-center-row/);
+  assert.match(page, /worker-center-log/);
+  assert.match(css, /\.worker-center-row/);
+  assert.match(css, /\.worker-center-facts/);
+  assert.match(css, /\.worker-center-log/);
+});

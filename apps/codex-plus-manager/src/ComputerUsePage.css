@@ -452,3 +452,104 @@ label.cu-setting { cursor:pointer; }
   white-space: normal;
   line-height: 1.45;
 }
+
+.cu-capability-summary .cu-card-head {
+  align-items: center;
+}
+
+.cu-capability-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.cu-capability-grid > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--surface-sunken) / 0.4);
+}
+
+.cu-capability-grid > div[data-ready="true"] {
+  border-color: hsl(var(--status-success) / 0.35);
+}
+
+.cu-capability-grid svg {
+  flex: none;
+  color: hsl(var(--muted-foreground));
+}
+
+.cu-capability-grid > div[data-ready="true"] svg {
+  color: hsl(var(--status-success));
+}
+
+.cu-capability-grid span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.cu-capability-grid strong {
+  font-size: 12px;
+}
+
+.cu-capability-grid small {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.cu-extension-browsers {
+  display: grid;
+  gap: 8px;
+}
+
+.cu-extension-browser {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.8fr) minmax(220px, 1.5fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--surface-sunken) / 0.35);
+}
+
+.cu-extension-browser[data-ready="true"] {
+  border-color: hsl(var(--status-success) / 0.35);
+}
+
+.cu-extension-browser-name,
+.cu-extension-browser-state {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.cu-extension-browser-name strong {
+  font-size: 12px;
+}
+
+.cu-extension-browser-state {
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+}
+
+.cu-extension-browser[data-ready="true"] .cu-extension-browser-state {
+  color: hsl(var(--status-success));
+}
+
+@media (max-width: 720px) {
+  .cu-capability-grid,
+  .cu-extension-browser {
+    grid-template-columns: 1fr;
+  }
+
+  .cu-extension-browser .mg-button {
+    width: fit-content;
+  }
+}

@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { appConfirm } from "./app-dialog";
-import { AlertTriangle, AppWindow, Check, CheckCircle2, FolderOpen, Globe, Loader2, MonitorSmartphone, MousePointerClick, Pencil, Play, Plug, Plus, RefreshCw, ShieldCheck, Trash2, Unplug, X } from "lucide-react";
+import { Activity, AlertTriangle, AppWindow, Check, CheckCircle2, FolderOpen, Globe, Loader2, MonitorSmartphone, MousePointerClick, Pencil, Play, Plug, Plus, RefreshCw, ShieldCheck, Trash2, Unplug, X } from "lucide-react";
 import { ComputerUsePreview } from "./ComputerUsePreview";
 import { AppSelect } from "./AppSelect";
 import { PageHeader } from "./ManagementPages";
@@ -51,6 +51,23 @@ type CuCheck = {
   durationMs?: number;
   failureKind?: CuFailureKind;
   failureDetail?: string;
+};
+type CuExtensionBrowser = {
+  family: "chrome" | "edge";
+  installed: boolean;
+  extensionInstalled: boolean;
+  hostRegistered: boolean;
+  userDataFound: boolean;
+  storeUrl: string;
+};
+type CuExtensionStatus = {
+  installed: boolean;
+  hostRegistered: boolean;
+  extensionInstalled: boolean;
+  storeUrl: string;
+  preferredStoreUrl?: string;
+  preferredBrowser?: "chrome" | "edge";
+  browsers?: CuExtensionBrowser[];
 };
 type CuResult = { status: string; message: string };
 type CuTab = "overview" | "preview" | "diagnose";
@@ -140,8 +157,8 @@ const computerUsePlatform = enhancementPlatformFromUserAgent(navigator.userAgent
 const computerUseSupported = computerUsePlatform === "macos" || computerUsePlatform === "windows";
 const computerUseIsWindows = computerUsePlatform === "windows";
 
-export function ComputerUsePage() {
-  return computerUseSupported ? <ComputerUseNativePage /> : <ComputerUseUnsupported />;
+export function ComputerUsePage({ onOpenWorkers }: { onOpenWorkers?: () => void } = {}) {
+  return computerUseSupported ? <ComputerUseNativePage onOpenWorkers={onOpenWorkers} /> : <ComputerUseUnsupported />;
 }
 
 /** 其它平台只给出明确的「暂不支持」说明，不去探测运行时。 */
@@ -160,7 +177,7 @@ function ComputerUseUnsupported() {
   </div>;
 }
 
-function ComputerUseNativePage() {
+function ComputerUseNativePage({ onOpenWorkers }: { onOpenWorkers?: () => void }) {
   const [status, setStatus] = useState<CuStatus | null>(null);
   const [check, setCheck] = useState<CuCheck | null>(null);
   const [backups, setBackups] = useState<Record<string, string>>({});
@@ -178,7 +195,7 @@ function ComputerUseNativePage() {
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
   const [approval, setApproval] = useState<CuApprovalState | null>(null);
-  const [extStatus, setExtStatus] = useState<{ installed: boolean; storeUrl: string } | null>(null);
+  const [extStatus, setExtStatus] = useState<CuExtensionStatus | null>(null);
   const mounted = useRef(false);
   const epoch = useRef(0);
   const lock = useRef(false);
@@ -331,19 +348,47 @@ function ComputerUseNativePage() {
     }
   }, []);
 
+  const loadExtensionStatus = useCallback(async () => {
+    try {
+      const next = await invoke<CuExtensionStatus>("computer_use_browser_extension_status");
+      if (mounted.current) setExtStatus(next);
+    } catch {
+      if (mounted.current) setExtStatus(null);
+    }
+  }, []);
+
+  const openExtensionStore = async (browser: "chrome" | "edge") => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy("extension");
+    setActionError("");
+    setNotice("");
+    try {
+      const result = await invoke<CuResult>("computer_use_open_extension_store", { browser });
+      if (!mounted.current) return;
+      if (result.status === "ok") setNotice(result.message);
+      else setActionError(result.message || t("打开扩展商店失败。"));
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
   useEffect(() => {
     mounted.current = true;
     void loadStatus();
     void loadApproval();
-    void invoke<{ installed: boolean; storeUrl: string }>("computer_use_browser_extension_status")
-      .then((r) => { if (mounted.current) setExtStatus(r); })
-      .catch(() => { /* 非致命，静默忽略 */ });
+    void loadExtensionStatus();
     return () => {
       mounted.current = false;
       epoch.current += 1;
       lock.current = false;
     };
-  }, [loadStatus]);
+  }, [loadStatus, loadExtensionStatus]);
 
   const openChatGpt = async () => {
     if (lock.current) return;
@@ -655,11 +700,11 @@ function ComputerUseNativePage() {
           {flowTarget("cu-target:desktop", <AppWindow size={16} />, t("本机桌面应用"),
             !status ? t("检测中…") : found ? t("经 Codex 桌面版原生 Computer Use") : t("未找到 Codex Computer Use 运行时"),
             Boolean(status) && !found)}
-          {flowTarget("cu-target:chrome", <Globe size={16} />, t("Chrome 标签页"),
-            extStatus == null ? t("检测中…") : chromeReady ? t("经 ChatGPT for Chrome 扩展，用你已登录的浏览器") : t("未安装 ChatGPT for Chrome 扩展"),
+          {flowTarget("cu-target:chrome", <Globe size={16} />, t("浏览器标签页"),
+            extStatus == null ? t("检测中…") : chromeReady ? t("经 ChatGPT 浏览器扩展，使用已登录的 Chrome 或 Edge") : t("Chrome 与 Edge 均未检测到 ChatGPT 扩展"),
             extStatus != null && !chromeReady,
             extStatus && !chromeReady
-              ? <button className="cu-hub-action" type="button" disabled={locked} onClick={() => void invoke("computer_use_open_extension_store")}>{t("安装扩展")}</button>
+              ? <button className="cu-hub-action" type="button" disabled={locked} onClick={() => void openExtensionStore(extStatus.preferredBrowser ?? (computerUseIsWindows ? "edge" : "chrome"))}>{t("安装扩展")}</button>
               : null)}
         </div>
       </HubTopology>
@@ -701,7 +746,13 @@ function ComputerUseNativePage() {
           <small>{t("同 Codex 的画中画：在屏幕右上角实时显示目标窗口；回合结束或空闲 20 秒自动收起。需要屏幕录制权限。")}</small>
         </span>
         <input className="cu-setting-check" type="checkbox" checked={approval?.pip ?? true} disabled={locked} onChange={(event) => void changePip(event.target.checked)} />
-      </label> : null}
+      </label> : <div className="cu-setting">
+        <span className="cu-setting-copy">
+          <strong>{t("悬浮预览仅 macOS 提供")}</strong>
+          <small>{t("Windows 不提供 Codex++ 的画中画悬浮窗；Computer Use 截图仍会随工具结果显示。需要持续查看时，可保留目标应用窗口或使用 Windows 截图工具。")}</small>
+        </span>
+        <span className="cu-badge" data-state="unsupported">{t("平台替代说明")}</span>
+      </div>}
     </div>
     <p className="cu-flow-foot">{cuMode === "js"
       ? t("接入后重启对应客户端。JS 方式下桌面与浏览器都用 mcp__codex-plus-cu__js，codex-plus-browser 不提供工具。")
@@ -800,6 +851,27 @@ function ComputerUseNativePage() {
       </div>
 
       {activeTab === "overview" && <>
+        <section className="cu-card cu-capability-summary" aria-labelledby="cu-capability-title">
+          <div className="cu-card-head">
+            <div>
+              <h2 id="cu-capability-title">{t("Agent 电脑控制能力")}</h2>
+              <p>{t("这里只显示能力是否可用；各 Worker 的启用状态、模型、并发和测试入口统一放在 Worker 控制中心。")}</p>
+            </div>
+            <button className="mg-button" type="button" onClick={onOpenWorkers} disabled={!onOpenWorkers}>
+              <Activity size={14} />{t("打开 Worker 控制中心")}
+            </button>
+          </div>
+          <div className="cu-capability-grid">
+            <div data-ready={found || undefined}>
+              <AppWindow size={16} />
+              <span><strong>{t("桌面控制")}</strong><small>{!status ? t("检测中…") : found ? t("可用") : t("运行时未就绪")}</small></span>
+            </div>
+            <div data-ready={extStatus?.installed || undefined}>
+              <Globe size={16} />
+              <span><strong>{t("浏览器控制")}</strong><small>{!extStatus ? t("检测中…") : extStatus.installed ? t("检测到扩展") : t("扩展未检测到")}</small></span>
+            </div>
+          </div>
+        </section>
         {renderFlow()}
         {status?.claudeDesktopRunning ? (
           <p className="cu-note cu-note-warn">{t("Claude Desktop 正在运行：它退出时会重写自己的配置，接入前建议先完全退出 Claude Desktop，改完再打开。")}</p>
@@ -954,7 +1026,7 @@ function ComputerUseNativePage() {
           </dl>
         </section>
 
-        <section className="cu-card" aria-labelledby="cu-ext-title">
+        <section className="cu-card" aria-labelledby="cu-ext-title" hidden>
           <div className="cu-card-head">
             <div>
               <h2 id="cu-ext-title">{t("Chrome 浏览器扩展")}</h2>
@@ -979,6 +1051,38 @@ function ComputerUseNativePage() {
                   </>
             }
           </div>
+        </section>
+
+        <section className="cu-card" aria-labelledby="cu-ext-title">
+          <div className="cu-card-head">
+            <div>
+              <h2 id="cu-ext-title">{t("浏览器扩展（Chrome / Edge）")}</h2>
+              <p>{t("扩展是可选的：只操作桌面窗口不需要安装；需要控制已登录的 Chrome 或 Edge 标签页时再安装。这里只检测安装文件，不把它当成已启用。")}</p>
+            </div>
+            <button className="mg-button" type="button" disabled={locked} onClick={() => void loadExtensionStatus()}>
+              <RefreshCw size={14} />{t("重新检测")}
+            </button>
+          </div>
+          <div className="cu-extension-browsers">
+            {(extStatus?.browsers ?? []).map((browser) => <div className="cu-extension-browser" data-ready={browser.installed || undefined} key={browser.family}>
+              <span className="cu-extension-browser-name">
+                <Globe size={15} />
+                <strong>{browser.family === "edge" ? "Microsoft Edge" : "Google Chrome"}</strong>
+              </span>
+              <span className="cu-extension-browser-state">
+                {browser.installed
+                  ? <><CheckCircle2 size={14} />{t("检测到安装")}</>
+                  : browser.userDataFound
+                    ? t("浏览器已安装，扩展未检测到")
+                    : t("未检测到浏览器配置目录")}
+              </span>
+              {!browser.installed && <button className="mg-button mg-primary" type="button" disabled={locked} onClick={() => void openExtensionStore(browser.family)}>
+                {tf("打开 {0} 扩展商店", [browser.family === "edge" ? "Edge" : "Chrome"])}
+              </button>}
+            </div>)}
+            {extStatus == null && <p className="cu-hint">{t("正在检测 Chrome 与 Edge 扩展…")}</p>}
+          </div>
+          {extStatus?.installed && <p className="cu-note">{t("检测到扩展文件。请重启浏览器和对应 Agent 会话，再用下方连接性检查确认浏览器工具链实际可用。")}</p>}
         </section>
 
         <section className="cu-card" aria-labelledby="cu-check-title">

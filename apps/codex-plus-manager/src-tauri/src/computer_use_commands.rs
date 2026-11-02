@@ -262,75 +262,152 @@ pub async fn computer_use_browser_extension_status() -> CommandResult<Value> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"));
-    // Codex 用的两个扩展 ID（生产版 + 另一发布渠道）。
     const EXT_IDS: &[&str] = &[
         "hehggadaopoacecdllhhajmbjkdcmajg",
         "odlomjlbamekndcpllcnffbgeohgkmjh",
     ];
-    #[cfg(target_os = "windows")]
-    let (host_registered, ext_installed) = {
-        let local = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("AppData/Local"));
-        let roots = [
-            local.join("Google/Chrome/User Data"),
-            local.join("Microsoft/Edge/User Data"),
-        ];
-        let mut installed = false;
-        for root in roots {
-            let Ok(entries) = std::fs::read_dir(root) else {
-                continue;
-            };
+    let inspect_browser = |family: &str,
+                           user_data: PathBuf,
+                           store_url: &str,
+                           host_registered: bool|
+     -> Value {
+        let user_data_found = user_data.is_dir();
+        let mut extension_installed = false;
+        if let Ok(entries) = std::fs::read_dir(&user_data) {
             for entry in entries.flatten() {
-                if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                if !entry
+                    .file_type()
+                    .map(|kind| kind.is_dir())
+                    .unwrap_or(false)
+                {
                     continue;
                 }
                 let extensions = entry.path().join("Extensions");
                 if EXT_IDS.iter().any(|id| extensions.join(id).is_dir()) {
-                    installed = true;
+                    extension_installed = true;
                     break;
                 }
             }
-            if installed {
-                break;
-            }
         }
-        (false, installed)
+        json!({
+            "family": family,
+            "installed": host_registered || extension_installed,
+            "extensionInstalled": extension_installed,
+            "hostRegistered": host_registered,
+            "userDataFound": user_data_found,
+            "storeUrl": store_url,
+        })
     };
-    #[cfg(not(target_os = "windows"))]
-    let (host_registered, ext_installed) = {
-        // native messaging host 文件：有它说明 Codex 已经注册过了。
-        let host_json = home
-            .join("Library/Application Support/Google/Chrome/NativeMessagingHosts")
-            .join("com.openai.codexextension.json");
-        // Chrome 扩展目录：有任意一个 ID 目录就视为已安装。
-        let ext_base =
-            home.join("Library/Application Support/Google/Chrome/Default/Extensions");
+
+    #[cfg(target_os = "windows")]
+    let (chrome, edge) = {
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Local"));
         (
-            host_json.is_file(),
-            EXT_IDS.iter().any(|id| ext_base.join(id).is_dir()),
+            inspect_browser(
+                "chrome",
+                local.join("Google/Chrome/User Data"),
+                "https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg",
+                false,
+            ),
+            inspect_browser(
+                "edge",
+                local.join("Microsoft/Edge/User Data"),
+                "https://microsoftedge.microsoft.com/addons/detail/odlomjlbamekndcpllcnffbgeohgkmjh",
+                false,
+            ),
         )
     };
-    let installed = host_registered || ext_installed;
+    #[cfg(not(target_os = "windows"))]
+    let (chrome, edge) = {
+        let chrome_host = home
+            .join("Library/Application Support/Google/Chrome/NativeMessagingHosts")
+            .join("com.openai.codexextension.json")
+            .is_file();
+        let edge_host = home
+            .join("Library/Application Support/Microsoft Edge/NativeMessagingHosts")
+            .join("com.openai.codexextension.json")
+            .is_file();
+        (
+            inspect_browser(
+                "chrome",
+                home.join("Library/Application Support/Google/Chrome"),
+                "https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg",
+                chrome_host,
+            ),
+            inspect_browser(
+                "edge",
+                home.join("Library/Application Support/Microsoft Edge"),
+                "https://microsoftedge.microsoft.com/addons/detail/odlomjlbamekndcpllcnffbgeohgkmjh",
+                edge_host,
+            ),
+        )
+    };
+
+    let chrome_ready = chrome["installed"].as_bool().unwrap_or(false);
+    let edge_ready = edge["installed"].as_bool().unwrap_or(false);
+    let chrome_user_data = chrome["userDataFound"].as_bool().unwrap_or(false);
+    let edge_user_data = edge["userDataFound"].as_bool().unwrap_or(false);
+    let preferred = if edge_user_data && !chrome_user_data {
+        "edge"
+    } else if chrome_user_data && !edge_user_data {
+        "chrome"
+    } else {
+        #[cfg(target_os = "windows")]
+        {
+            "edge"
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "chrome"
+        }
+    };
+    let preferred_store_url = if preferred == "edge" {
+        "https://microsoftedge.microsoft.com/addons/detail/odlomjlbamekndcpllcnffbgeohgkmjh"
+    } else {
+        "https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg"
+    };
+    let summary = match (chrome_ready, edge_ready) {
+        (true, true) => "已检测到 Chrome 与 Edge 中的 ChatGPT 浏览器扩展。",
+        (true, false) => "已检测到 Chrome 中的 ChatGPT 浏览器扩展。",
+        (false, true) => "已检测到 Edge 中的 ChatGPT 浏览器扩展。",
+        (false, false) => "Chrome 与 Edge 均未检测到 ChatGPT 浏览器扩展。",
+    };
     ok(
-        if installed {
-            "Chrome 浏览器扩展已安装。"
-        } else {
-            "Chrome 浏览器扩展未安装。"
-        },
+        summary,
         json!({
-            "installed": installed,
-            "hostRegistered": host_registered,
-            "extensionInstalled": ext_installed,
-            "storeUrl": "https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg",
+            "installed": chrome_ready || edge_ready,
+            "hostRegistered": chrome["hostRegistered"].as_bool().unwrap_or(false)
+                || edge["hostRegistered"].as_bool().unwrap_or(false),
+            "extensionInstalled": chrome["extensionInstalled"].as_bool().unwrap_or(false)
+                || edge["extensionInstalled"].as_bool().unwrap_or(false),
+            "storeUrl": preferred_store_url,
+            "preferredStoreUrl": preferred_store_url,
+            "preferredBrowser": preferred,
+            "browsers": [chrome, edge],
         }),
     )
 }
 
-/// 打开 Chrome Web Store 里的 ChatGPT 扩展页，让用户点「添加到 Chrome」。
+/// 打开 Chrome 或 Edge 商店里的 ChatGPT 扩展页。
 #[tauri::command]
-pub async fn computer_use_open_extension_store() -> CommandResult<Value> {
-    let url = "https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg";
+pub async fn computer_use_open_extension_store(browser: Option<String>) -> CommandResult<Value> {
+    let family = browser
+        .as_deref()
+        .unwrap_or(if cfg!(windows) { "edge" } else { "chrome" })
+        .to_ascii_lowercase();
+    let (family, url) = match family.as_str() {
+        "chrome" => (
+            "chrome",
+            "https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg",
+        ),
+        "edge" => (
+            "edge",
+            "https://microsoftedge.microsoft.com/addons/detail/odlomjlbamekndcpllcnffbgeohgkmjh",
+        ),
+        _ => return failed("浏览器只能是 chrome 或 edge", json!({})),
+    };
     #[cfg(windows)]
     let result = codex_plus_core::windows_open_url(url).map_err(|e| e.to_string());
     #[cfg(not(windows))]
@@ -340,8 +417,14 @@ pub async fn computer_use_open_extension_store() -> CommandResult<Value> {
         .map(|_| ())
         .map_err(|e| e.to_string());
     match result {
-        Ok(()) => ok("已打开 Chrome Web Store 扩展页。", json!({ "url": url })),
-        Err(error) => failed(&format!("打开扩展页失败：{error}"), json!({ "url": url })),
+        Ok(()) => ok(
+            &format!("已打开 {family} 浏览器扩展商店。"),
+            json!({ "url": url, "browser": family }),
+        ),
+        Err(error) => failed(
+            &format!("打开扩展页失败：{error}"),
+            json!({ "url": url, "browser": family }),
+        ),
     }
 }
 

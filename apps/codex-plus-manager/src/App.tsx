@@ -4794,7 +4794,7 @@ export function App() {
           {route === "recommendations" ? <RecommendationsScreen ads={ads} actions={actions} /> : null}
           {route === "agentCache" ? <AgentCachePanel /> : null}
           {route === "agentCollaboration" ? <AgentCollaborationPage /> : null}
-          {route === "computerUse" ? <ComputerUsePage /> : null}
+          {route === "computerUse" ? <ComputerUsePage onOpenWorkers={() => void navigate("agentCollaboration")} /> : null}
           {route === "agentPet" ? (
             <AgentPetPage
               settings={settingsForm.agentPet}
