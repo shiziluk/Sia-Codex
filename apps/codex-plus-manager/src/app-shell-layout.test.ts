@@ -397,10 +397,12 @@ test("首次使用引导：首次启动自动打开（预览模式除外），�
   }
 });
 
-test("设置页「版本与更新」：已是最新时不显示旧版本的安装包和说明；有新版本时说明收进可展开区", () => {
+test("设置页「版本与更新」：下游版只提示上游版本，不暴露安装包操作", () => {
   const about = functionSource("AboutScreen");
-  assert.match(about, /update\?\.updateAvailable && update\.assetName \?/);
   assert.match(about, /\{update\?\.updateAvailable && update\.releaseSummary \? \(\n\s*<details className="app-update-notes">/);
+  assert.match(about, /仅提示，不自动安装/);
+  assert.match(about, /本构建不会下载或启动上游安装包/);
+  assert.doesNotMatch(about, /<Button[^>]+performUpdate/);
   assert.doesNotMatch(about, /<Metric label=\{t\("状态"\)\}/);
 });
 

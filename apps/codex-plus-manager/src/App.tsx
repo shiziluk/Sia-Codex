@@ -1167,6 +1167,8 @@ type UpdateResult = CommandResult<{
   assetName?: string | null;
   assetUrl?: string | null;
   updateAvailable?: boolean;
+  installAllowed?: boolean;
+  downstreamPolicy?: "manual-port" | string;
   installedPath?: string;
   progress?: number;
 }>;
@@ -1325,7 +1327,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   // 缓存清理覆盖多个 AI 应用，属于应用级页面，在各工具下均可访问。
   { id: "agentCache", get label() { return t("AI Agent 缓存清理"); }, icon: Trash2 },
   // 跨客户端协作属于应用级能力，各工具下共用同一组任务。
-  { id: "agentCollaboration", get label() { return t("Agent 协作"); }, icon: GitBranch, badge: "实验" },
+  { id: "agentCollaboration", get label() { return t("Agent 编排台"); }, icon: GitBranch, badge: "实验" },
   { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验" },
   // 桌宠服务所有 Agent（目前只接入了 Codex），与具体 Agent 无关，放在「工具」里。
   { id: "agentPet", get label() { return t("Agent 桌宠"); }, icon: PawPrint },
@@ -4885,7 +4887,6 @@ export function App() {
       {updatePrompt ? (
         <UpdateDialog
           update={updatePrompt}
-          progress={updateInstallProgress}
           onClose={closeUpdatePrompt}
           onSkipVersion={() => {
             if (updatePrompt.latestVersion) void skipUpdateVersion(updatePrompt.latestVersion);
@@ -4894,7 +4895,6 @@ export function App() {
             updateNotifications.current.muteToday();
             setUpdatePrompt(null);
           }}
-          onUpdate={() => void performUpdate(updatePrompt)}
           onOpenUrl={(url) => void openExternalUrl(url)}
         />
       ) : null}
@@ -10462,7 +10462,7 @@ function AboutScreen({
   return (
     <>
       <Panel id="app-settings-update">
-        <CardHead title={t("版本与更新")} detail={t("从 GitHub Release 下载安装包更新")} />
+        <CardHead title={t("版本与更新")} detail={t("仅提示上游版本；下游定制版手工移植变更")} />
         <CardContent>
           {/* 一行摘要 + 操作；发布说明在下面，下载进度只在下载时出现。 */}
           <div className="app-update-summary">
@@ -10474,27 +10474,22 @@ function AboutScreen({
                   : update?.latestVersion
                     ? t("已是最新版本")
                     : t("尚未检查更新")}
-                {update?.updateAvailable && update.assetName ? ` · ${update.assetName}` : ""}
+                {update?.updateAvailable ? ` · ${t("仅提示，不自动安装")}` : ""}
               </span>
             </div>
             <div className="app-update-actions">
               <Button onClick={() => void actions.checkUpdate()} variant={update?.updateAvailable ? "secondary" : "default"}>{t("检查更新")}</Button>
-              {update?.updateAvailable ? (
-                <Button disabled={updateInstallProgress.active} onClick={() => void actions.performUpdate()}>
-                  {updateInstallProgress.active ? t("正在下载安装包…") : t("下载并运行安装包")}
-                </Button>
-              ) : null}
             </div>
           </div>
           {/* 改的是设置草稿，由同页 GlobalSettingsScreen 的自动保存落盘（#1272）。 */}
           <div className="global-settings-list app-update-preferences">
             <div className="global-setting-row">
               <div className="global-setting-copy">
-                <strong>{t("启动时自动检查更新")}</strong>
-                <span>{t("打开 Codex++ 时及运行期间每隔几小时在后台检查新版本并提示。关闭后不再自动检查，仍可随时点「检查更新」。")}</span>
+                <strong>{t("启动时自动检查上游更新")}</strong>
+                <span>{t("只联网检查并提示上游版本与 Release 变更，不下载或安装。关闭后仍可手动检查。")}</span>
               </div>
               <div className="global-setting-actions">
-                <Switch label={t("启动时自动检查更新")} on={form.updateAutoCheck !== false} onToggle={() => onFormChange({ ...form, updateAutoCheck: form.updateAutoCheck === false })} />
+                <Switch label={t("启动时自动检查上游更新")} on={form.updateAutoCheck !== false} onToggle={() => onFormChange({ ...form, updateAutoCheck: form.updateAutoCheck === false })} />
               </div>
             </div>
           </div>
@@ -10504,7 +10499,7 @@ function AboutScreen({
               <ReleaseNotes markdown={update.releaseSummary} onOpenUrl={(url) => void actions.openExternalUrl(url)} />
             </details>
           ) : null}
-          <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
+          <p className="update-dialog-hint">{t("本构建不会下载或启动上游安装包。检查更新只用于提示版本和 Release 变更。")}</p>
         </CardContent>
       </Panel>
       <Panel id="app-settings-about">
@@ -14769,13 +14764,11 @@ function DreamSkinUnsavedDialog({
   );
 }
 
-function UpdateDialog({ update, progress, onClose, onSkipVersion, onMuteToday, onUpdate, onOpenUrl }: {
+function UpdateDialog({ update, onClose, onSkipVersion, onMuteToday, onOpenUrl }: {
   update: UpdateResult;
-  progress: TaskProgress;
   onClose: () => void;
   onSkipVersion: () => void;
   onMuteToday: () => void;
-  onUpdate: () => void;
   onOpenUrl: (url: string) => void;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -14797,15 +14790,9 @@ function UpdateDialog({ update, progress, onClose, onSkipVersion, onMuteToday, o
       <div className="update-dialog-body">
         <ReleaseNotes markdown={update.releaseSummary || t("发现可用更新。")} onOpenUrl={onOpenUrl} />
       </div>
-      <TaskProgressBox completedTitle={t("上次更新结果")} progress={progress} title={t("安装包更新进度")} />
-      <p className="update-dialog-hint">{t("也可随时在“关于”页面检查和安装更新。")}</p>
-      {!update.assetName || !update.assetUrl ? <p className="update-dialog-hint">{t("此版本暂未提供适用于当前系统的安装包。")}</p> : null}
+      <p className="update-dialog-hint">{t("下游定制版只提示上游版本，不会自动下载或安装。请审阅变更并在本地维护分支中手工移植。")}</p>
       <Toolbar className="update-dialog-actions">
-        <Button autoFocus disabled={progress.active || !update.assetName || !update.assetUrl} onClick={onUpdate}>
-          <Download className="h-4 w-4" />
-          {progress.active ? t("正在下载安装包…") : t("立即更新")}
-        </Button>
-        <Button variant="secondary" onClick={onClose}>{t("关闭提示")}</Button>
+        <Button autoFocus variant="secondary" onClick={onClose}>{t("关闭提示")}</Button>
         <Button variant="ghost" onClick={onMuteToday}>{t("今日不再提示")}</Button>
         <Button variant="ghost" onClick={onSkipVersion}>{t("跳过此版本")}</Button>
       </Toolbar>
@@ -16253,7 +16240,7 @@ function routeSubtitle(route: Route) {
     pluginMarket: t("检索插件，按需下载并安装到 Codex"),
     recommendations: t("来自 Codex++ 广告源的推荐，点卡片在浏览器里打开"),
     agentCache: t("扫描 Codex、Claude 与 Codex++ 的已知缓存目录，由你选择清理项目。"),
-    agentCollaboration: t("连接 Codex、DeepSeek Harness 与 Claude Code，派发任务并查看结果。"),
+    agentCollaboration: t("以 Codex++ 为总调度，连接 Codex、DeepSeek Harness 与 Claude Code，查看队列、状态与结果。"),
     computerUse: t("复用 Codex 的 Computer Use，通过 MCP 接给 Claude Code、Claude Desktop 与 Codex。"),
     agentPet: t("在 Agent 窗口里放一个可拖动的小角色，点一下压扁回弹，带按压音效"),
     hub: t("任意 Agent 经 Codex++ 接入任意供应商：谁在用、走哪家、是否健康，一屏看全"),

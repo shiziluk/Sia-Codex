@@ -6863,6 +6863,8 @@ pub async fn check_update() -> CommandResult<Value> {
                     "assetName": update.asset_name,
                     "assetUrl": update.asset_url,
                     "updateAvailable": update.update_available,
+                    "installAllowed": false,
+                    "downstreamPolicy": "manual-port",
                     "progress": 0
                 }),
             }
@@ -6876,6 +6878,8 @@ pub async fn check_update() -> CommandResult<Value> {
                 "assetName": Value::Null,
                 "assetUrl": Value::Null,
                 "updateAvailable": false,
+                "installAllowed": false,
+                "downstreamPolicy": "manual-port",
                 "progress": 0
             }),
         ),
@@ -6930,7 +6934,7 @@ pub async fn perform_update(
 // 无需 app runtime 的业务核心；其它平台测试不应引入 Wry 析构依赖。
 async fn perform_update_inner<F>(
     release: Option<codex_plus_core::update::Release>,
-    mut on_progress: F,
+    _on_progress: F,
 ) -> CommandResult<Value>
 where
     F: FnMut(codex_plus_core::update::UpdateProgress) + Send,
@@ -6944,39 +6948,17 @@ where
             }),
         );
     };
-    let download_dir = codex_plus_core::paths::default_app_state_dir().join("updates");
-    match codex_plus_core::update::perform_update_with_progress(
-        &release,
-        &download_dir,
-        &mut on_progress,
-    )
-    .await
-    {
-        Ok(result) => ok(
-            if cfg!(target_os = "macos") {
-                "安装包已验证，Codex++ 将关闭以安装更新，完成后自动重启；失败时保留旧版。"
-            } else {
-                "安装包已下载并启动，请按安装向导完成更新。"
-            },
-            json!({
+    failed(
+        "此版本是下游维护版，不自动下载或安装上游更新。请阅读 Release 变更并手工移植到本地维护分支。",
+        json!({
             "currentVersion": codex_plus_core::version::VERSION,
-            "latestVersion": result.release.version,
-            "releaseSummary": result.release.body,
-            "installedPath": result.installer_path.to_string_lossy(),
-            "launched": result.launched,
-            "progress": 100
-            }),
-        ),
-        Err(error) => failed(
-            &format!("安装更新失败：{error}"),
-            json!({
-                "currentVersion": codex_plus_core::version::VERSION,
-                "latestVersion": release.version,
-                "releaseSummary": release.body,
-                "progress": 0
-            }),
-        ),
-    }
+            "latestVersion": release.version,
+            "releaseSummary": release.body,
+            "installAllowed": false,
+            "downstreamPolicy": "manual-port",
+            "progress": 0
+        }),
+    )
 }
 
 #[tauri::command]
@@ -10489,6 +10471,26 @@ base_url = "https://example.invalid/v1"
 
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("请先检查更新"));
+    }
+
+    #[test]
+    fn downstream_build_never_downloads_an_upstream_release() {
+        let release = codex_plus_core::update::Release {
+            version: "v99.0.0".to_string(),
+            url: "https://example.test/release".to_string(),
+            body: "notes".to_string(),
+            asset_name: Some("installer.exe".to_string()),
+            asset_url: Some("https://example.test/installer.exe".to_string()),
+        };
+        let result = tauri::async_runtime::block_on(perform_update_inner(
+            Some(release),
+            |_| {},
+        ));
+
+        assert_eq!(result.status, "failed");
+        assert!(result.message.contains("下游维护版"));
+        assert_eq!(result.payload["installAllowed"], false);
+        assert_eq!(result.payload["downstreamPolicy"], "manual-port");
     }
 
     #[test]

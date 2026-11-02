@@ -99,3 +99,22 @@
 - 默认直接提交并合入 `main`。
 - 仅在用户明确要求时创建 PR。
 - 提交信息、PR 描述里不加 `Co-Authored-By: Claude …` 等 AI 署名；本地 `.git/hooks/commit-msg` 也会自动删掉这一行。
+
+## 下游定制维护（覆盖自动跟随更新）
+
+- 本仓库当前是下游定制版，长期分支为 `codex/sansheng-orchestration`。
+- 禁止把上游新版本自动 `pull`、merge、rebase 或通过应用内安装器覆盖到长期分支。
+- 上游发版后只先读 Release、`CHANGELOG.md` 和版本间 diff；按安全修复、兼容修复、可用新功能分类。
+- 每个上游版本使用临时 `upgrade/vX.Y.Z` 分支，只选择性 cherry-pick 或重新实现需要的部分，保留本地三省编排和 UI。
+- 自动更新入口只能保留“检查并提示”；不得下载或启动上游安装包，后端也必须拒绝 `perform_update`。
+- 替换 `%CODEX_PLUS_INSTALL_DIR%\codex-plus-plus.exe` 前必须备份旧二进制，并在新构建上完成测试和冒烟验收。
+- 详细流程见 `docs/LOCAL-DOWNSTREAM.md`。
+
+## WorkBuddy 模型路由
+
+- 默认从 `hy3` 开始。
+- 本地时间 00:00–05:59 把 `hy4-preview` 加入候选，使用其凌晨免费额度。
+- `hy3` 和 `hy4-preview` 的额度都不可用时，在 WorkBuddy 内切换到 `glm-5.3-flash`。
+- Trae 独立使用 `glm-5.3-flash`；WorkBuddy 的额度回退不能静默改派成 Trae。
+- WorkBuddy 显示完成但没有可见正文时，视为可重试的模型失败并继续下一个候选；
+  超时、取消或结果不确定绝不能报告为成功。

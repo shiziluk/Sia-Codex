@@ -6,7 +6,7 @@
 
   // Bridge requests are deduplicated by answer identity and guarded against late responses from older turns.
   function requestBridgeStepwise(key, userText, assistantText, requestMode = stepwiseGenerationMode(), options = {}) {
-    if (!stepwiseEnabled() || !key || state.bridgePendingHash === key || state.bridgeCache.has(key)) return;
+    if (!stepwiseConfigurationReady() || !key || state.bridgePendingHash === key || state.bridgeCache.has(key)) return;
 
     const normalizedMode = normalizeGenerationMode(requestMode);
     if (normalizedMode === "manual" && options.userInitiated !== true) return;
@@ -99,6 +99,13 @@
 
   function forceRefreshStepwise() {
     if (!isCurrentRuntime() || !stepwiseEnabled()) return;
+    if (!stepwiseConfigurationReady()) {
+      state.activeTab = "settings";
+      state.settingsStatus = statusLine(state.settings);
+      renderFloat();
+      if (!state.open) setOpen(true, "panel");
+      return;
+    }
     if (state.bridgeStatus === "pending") {
       setScanStatus("manual-refresh-pending", {});
       return;

@@ -1,0 +1,9 @@
+[[allowlists]]
+description = "Deterministic non-secret values used by public tests and synthetic runtime fixtures"
+regexTarget = "line"
+regexes = [
+  '''0123456789abcdef''',
+  '''sk-test''',
+  '''sk-1234567890''',
+  '''KEY_A''',
+]

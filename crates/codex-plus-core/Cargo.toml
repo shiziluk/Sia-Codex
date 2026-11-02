@@ -10,6 +10,7 @@ aes-gcm.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
 base64.workspace = true
+chrono = "0.4"
 directories.workspace = true
 futures-util = "0.3"
 http.workspace = true

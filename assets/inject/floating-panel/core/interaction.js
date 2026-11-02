@@ -644,6 +644,9 @@
       event.stopPropagation();
       return;
     }
+    if (!state.open && stepwiseEnabled() && !stepwiseConfigurationReady()) {
+      state.activeTab = "settings";
+    }
     setOpen(!state.open, state.open ? "chip" : (event.detail === 0 ? "panel" : ""));
   }
 

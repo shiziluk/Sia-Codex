@@ -36,6 +36,11 @@ Codex 获得异步任务 ID 后可以继续独立工作，再通过等待或查�
 - 并发执行的每个任务都有独立的 CLI 进程、原生会话和 `taskId`，`wait_task`、`get_task`、`cancel_task` 只作用于传入的那个任务。CLI 直接在各自的工作目录中修改文件，协作服务不做隔离：可能同时运行的任务应使用不同的工作目录（例如各自的 git worktree）。同一工作目录还有其他任务可能同时运行时不会拒绝，只在委派返回的 `cwdWarning` 和任务启动时的 `progress` 中提示一句。
 - 每个 Agent 最多排队 8 个任务（不含正在执行的），超出时明确报错，不写入任务。排队等待的时间不计入单个任务的运行上限。取消排队中的任务会立即把它移出队列，后面的任务顺位前移；取消运行中的任务时，该任务在 CLI 停止前仍占用一个并发名额。
 - 不同 Agent 之间始终可以并行，各自的并发上限互不影响。
+- 三省工作流进入执行阶段后，会把当前依赖已满足的全部子任务一起提交，再等待这一层全部结束；不同 Agent 可立即并行，同一 Agent 仍按上面的并发上限和提交顺序排队。必须等上一层完成后，后续依赖节点才会解锁。
+- 子任务可声明 `workspaceMode: "worktree"`。执行器只对干净 Git 仓库创建独立工作树，并把任务 cwd 指向该目录；完成后记录分支、基础提交和变更文件。默认根目录为 `<Codex++ state>/agent-collaboration/worktrees`，可用 `CODEX_PLUS_WORKTREE_ROOT` 覆盖。默认 `mergeMode: "none"`，产物只保留供审核。
+- `workspaceMode: "worktree"` 可配合 `mergeMode: "auto"`。宰相准奏后工作流进入 `merging`：先在独立集成工作树中逐个合并，全部成功才用 `--ff-only` 推进主分支，并清理已合并 worktree/分支；冲突时主分支保持原样，失败现场保留供排查。
+- 自动合并冲突会停在 `merge_conflict`，不会直接终止。用户修正对应 worktree 分支后调用 `sansheng_retry_merge`，或点击管理器中的“重新合并”；主分支仍只在完整成功后推进。
+- 自动合并策略由 `mergeStrategy` 指定：`merge` 保留 worktree 分支历史，`squash` 压成一个提交，`cherry-pick` 逐个移植 worktree 提交。协议与事件格式见 `docs/sansheng-orchestration-protocol-v1.md`。
 - 新任务创建独立会话；已完成且记录了原生会话 ID 的任务可选择「继续该任务」，续聊固定原 Agent 与工作目录。
 - 提示词经 stdin 传入，不通过 shell 拼接。协作服务不会读取、复制或改写各 CLI 的凭据和供应商配置。
 - 任务最长运行 10 分钟；取消会停止本次启动的 CLI，Unix 同时停止其进程组。已发生的文件或外部操作不回滚。
@@ -75,6 +80,12 @@ DSH headless 默认使用环境凭据。若已在 DeepSeek Harness 中登录或�
 | `get_task` | 按 `taskId` 查询进度、最终答案和原生会话 ID |
 | `list_tasks` | 查看最近任务及活跃任务 |
 | `cancel_task` | 请求停止指定任务；排队中的任务立即取消并移出队列 |
+| `sansheng_dispatch` | 创建规划、审核、执行、结果复核和准奏门控工作流 |
+| `sansheng_status` | 查询工作流、计划、审核意见和子任务状态 |
+| `sansheng_events` | 按 `afterSeq` 游标增量读取版本化事件流 |
+| `sansheng_accept` | 宰相准奏；有自动合并时继续进入 `merging` |
+| `sansheng_retry_merge` | 修正冲突后重新执行自动合并 |
+| `sansheng_cancel` | 取消工作流并级联停止未完成子任务 |
 
 `send_task` 参数示例：
 

@@ -5,7 +5,11 @@ pub mod executor;
 pub mod integration;
 pub mod mcp;
 pub mod native_refresh;
+pub mod pipeline;
+pub mod protocol;
 mod queue_owner;
+pub mod sse;
+mod worktree;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +23,8 @@ use serde_json::{Value, json};
 pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_TASKS: usize = 1000;
+const MAX_WORKFLOWS: usize = 200;
+const MAX_WORKFLOW_EVENTS: usize = 10_000;
 const WORKER_LEASE_MS: u64 = 30 * 1000;
 const QUEUED_LEASE_MS: u64 = 60 * 1000;
 /// 排队任务由提交它的进程定期续租；间隔远小于 QUEUED_LEASE_MS，进程失联后才会过期。
@@ -108,7 +114,10 @@ pub struct CollaborationConfig {
     /// 单个子 Agent 任务的运行上限（分钟）。旧配置没有此字段时取默认 10 分钟（#2618）。
     /// 取默认值时不写出：v1.10.0 的结构带 `deny_unknown_fields`，回退旧版本时
     /// 多出的字段会让整份协作记录读不出来。
-    #[serde(default = "default_max_runtime_minutes", skip_serializing_if = "is_default_max_runtime_minutes")]
+    #[serde(
+        default = "default_max_runtime_minutes",
+        skip_serializing_if = "is_default_max_runtime_minutes"
+    )]
     pub max_runtime_minutes: u32,
 }
 
@@ -137,6 +146,8 @@ impl Default for CollaborationConfig {
                 ("codex", "Codex"),
                 ("deepseek", "DeepSeek Harness"),
                 ("claude", "Claude Code"),
+                ("workbuddy", "WorkBuddy"),
+                ("trae", "Trae CN"),
             ]
             .into_iter()
             .map(|(id, name)| AgentConfig {
@@ -180,12 +191,208 @@ pub struct TaskRecord {
     pub updated_at_ms: u64,
     pub cancel_requested: bool,
     pub progress: String,
+    /// The workflow that owns this task, if it was created by the Sansheng
+    /// pipeline. Kept optional so old task records remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    /// Planning/review/execution/result-review/repair. Empty for legacy tasks.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanSubtask {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub agent_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub workspace_mode: String,
+    #[serde(default)]
+    pub merge_mode: String,
+    #[serde(default)]
+    pub merge_strategy: String,
+    pub expected_output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorktreeRecord {
+    pub path: String,
+    pub branch_name: String,
+    pub base_commit: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MergeConflictPreview {
+    pub file: String,
+    #[serde(default)]
+    pub base_exists: bool,
+    #[serde(default)]
+    pub ours_exists: bool,
+    #[serde(default)]
+    pub theirs_exists: bool,
+    #[serde(default)]
+    pub base: String,
+    #[serde(default)]
+    pub ours: String,
+    #[serde(default)]
+    pub theirs: String,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowEvent {
+    pub seq: u64,
+    pub workflow_id: String,
+    pub kind: String,
+    pub phase: WorkflowPhase,
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub data: Value,
+    pub created_at_ms: u64,
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringList {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match Option::<StringList>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(StringList::One(value)) if value.trim().is_empty() => Vec::new(),
+        Some(StringList::One(value)) => vec![value],
+        Some(StringList::Many(values)) => values,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanObject {
+    pub goal: String,
+    pub subtasks: Vec<PlanSubtask>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub risks: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub acceptance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPhase {
+    Planning,
+    PlanReview,
+    Executing,
+    ResultReview,
+    AwaitingAcceptance,
+    Merging,
+    MergeConflict,
+    Completed,
+    Failed,
+    Cancelled,
+    Blocked,
+    Interrupted,
+}
+
+impl WorkflowPhase {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled
+        )
+    }
+}
+
+fn merge_conflict_key(subtask_id: &str, file: &str) -> String {
+    format!("{subtask_id}\u{1f}{file}")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkflowRecord {
+    pub id: String,
+    pub objective: String,
+    pub cwd: String,
+    pub planner_agent_id: String,
+    pub reviewer_agent_id: String,
+    pub executor_agent_id: String,
+    pub allowed_agent_ids: Vec<String>,
+    pub phase: WorkflowPhase,
+    pub plan: Option<PlanObject>,
+    pub plan_revision: u32,
+    pub review_round: u32,
+    pub max_review_rounds: u32,
+    pub result_review_round: u32,
+    pub repair_count: u32,
+    pub review_decision: String,
+    pub review_notes: String,
+    pub planner_task_id: String,
+    pub reviewer_task_id: String,
+    pub result_reviewer_task_id: String,
+    pub repair_task_id: String,
+    pub subtask_task_ids: BTreeMap<String, String>,
+    pub subtask_outputs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub subtask_worktrees: BTreeMap<String, WorktreeRecord>,
+    #[serde(default)]
+    pub merge_commit: String,
+    #[serde(default)]
+    pub merge_conflicts: Vec<String>,
+    #[serde(default)]
+    pub merge_conflict_task_id: String,
+    #[serde(default)]
+    pub merge_resolutions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub merge_custom_contents: BTreeMap<String, String>,
+    #[serde(default)]
+    pub merge_conflict_previews: Vec<MergeConflictPreview>,
+    #[serde(default)]
+    pub merge_summary: String,
+    pub result_summary: String,
+    pub acceptance_notes: String,
+    pub error: String,
+    pub controller_id: String,
+    pub owner_id: String,
+    pub lease_until_ms: u64,
+    pub cancel_requested: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct State {
     config: CollaborationConfig,
     tasks: Vec<TaskRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workflows: Vec<WorkflowRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workflow_events: Vec<WorkflowEvent>,
     /// 排队任务的持有进程：任务 id → 持有者 id（见 [`queue_owner`]），只记录仍在排队的任务。
     /// 旧版本读取时忽略此字段，回退不受影响。
     #[serde(
@@ -194,6 +401,50 @@ struct State {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     queue_owners: BTreeMap<String, String>,
+}
+
+fn append_event_to_state(
+    state: &mut State,
+    workflow_id: &str,
+    kind: &str,
+    task_id: &str,
+    role: &str,
+    message: &str,
+    data: Value,
+) -> u64 {
+    let Some(workflow) = state
+        .workflows
+        .iter()
+        .find(|workflow| workflow.id == workflow_id)
+    else {
+        return 0;
+    };
+    let phase = workflow.phase.clone();
+    let seq = state
+        .workflow_events
+        .iter()
+        .filter(|event| event.workflow_id == workflow_id)
+        .map(|event| event.seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    state.workflow_events.push(WorkflowEvent {
+        seq,
+        workflow_id: workflow_id.to_string(),
+        kind: kind.to_string(),
+        phase,
+        task_id: task_id.to_string(),
+        role: role.to_string(),
+        message: message.to_string(),
+        data,
+        created_at_ms: now_ms(),
+    });
+    if state.workflow_events.len() > MAX_WORKFLOW_EVENTS {
+        state
+            .workflow_events
+            .drain(0..state.workflow_events.len() - MAX_WORKFLOW_EVENTS);
+    }
+    seq
 }
 
 #[derive(Debug, Clone)]
@@ -216,7 +467,10 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn is_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
+    matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "interrupted" | "handed_off"
+    )
 }
 
 impl Store {
@@ -366,9 +620,15 @@ impl Store {
                 .filter(|task| !is_terminal(&task.status))
                 .count();
             tasks.truncate(50.max(active_count));
+            let mut workflows = state.workflows.clone();
+            workflows.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+            workflows.truncate(50);
             Ok(
                 json!({"config": state.config, "availability": availability, "tasks": tasks,
+                    "workflows": workflows,
                 "capabilities": {"cliTasks": true, "desktopSessionWake": false,
+                    "sanshengWorkflows": true, "sanshengSse": true,
+                    "conflictEditor": true, "graphCanvas": true,
                     "maxQueuedPerAgent": MAX_QUEUED_PER_AGENT,
                     "maxConcurrentTasksLimit": MAX_CONCURRENT_TASKS_LIMIT}}),
             )
@@ -376,14 +636,35 @@ impl Store {
     }
 
     pub fn submit(&self, request: TaskRequest) -> anyhow::Result<TaskRecord> {
+        self.submit_inner(request, None, "")
+    }
+
+    pub(super) fn submit_workflow_task(
+        &self,
+        request: TaskRequest,
+        workflow_id: String,
+        role: &str,
+    ) -> anyhow::Result<TaskRecord> {
+        self.submit_inner(request, Some(workflow_id), role)
+    }
+
+    fn submit_inner(
+        &self,
+        request: TaskRequest,
+        workflow_id: Option<String>,
+        role: &str,
+    ) -> anyhow::Result<TaskRecord> {
         if request.prompt.trim().is_empty()
             || request.prompt.len() > MAX_PROMPT_BYTES
             || request.prompt.contains('\0')
         {
             bail!("任务内容不能为空，且不能超过 64 KiB 或包含空字符");
         }
-        if !matches!(request.agent_id.as_str(), "codex" | "deepseek" | "claude") {
-            bail!("不支持的 agent；仅支持 codex、deepseek、claude");
+        if !matches!(
+            request.agent_id.as_str(),
+            "codex" | "deepseek" | "claude" | "workbuddy" | "trae"
+        ) {
+            bail!("不支持的 agent；仅支持 codex、deepseek、claude、workbuddy、trae");
         }
         let path = Path::new(&request.cwd);
         if !path.is_absolute() || !path.is_dir() {
@@ -465,14 +746,412 @@ impl Store {
                 updated_at_ms: timestamp,
                 cancel_requested: false,
                 progress: queue_progress(ahead),
+                workflow_id,
+                role: role.to_string(),
             };
             state.tasks.push(task.clone());
+            if let Some(workflow_id) = task.workflow_id.as_deref() {
+                append_event_to_state(
+                    state,
+                    workflow_id,
+                    "task_submitted",
+                    &task.id,
+                    &task.role,
+                    &format!("{} 任务已提交", task.agent_id),
+                    json!({"agentId": task.agent_id, "status": task.status}),
+                );
+            }
             Ok(task)
         })
     }
 
     pub fn task(&self, id: &str) -> anyhow::Result<TaskRecord> {
         self.with_state(|state| Ok(find_task(state, id)?.clone()))
+    }
+
+    pub fn workflow(&self, id: &str) -> anyhow::Result<WorkflowRecord> {
+        self.with_state(|state| Ok(find_workflow(state, id)?.clone()))
+    }
+
+    pub fn workflows(&self) -> anyhow::Result<Vec<WorkflowRecord>> {
+        self.with_state(|state| Ok(state.workflows.clone()))
+    }
+
+    pub fn workflow_tasks(&self, id: &str) -> anyhow::Result<Vec<TaskRecord>> {
+        self.with_state(|state| {
+            Ok(state
+                .tasks
+                .iter()
+                .filter(|task| task.workflow_id.as_deref() == Some(id))
+                .cloned()
+                .collect())
+        })
+    }
+
+    pub fn workflow_events(
+        &self,
+        id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WorkflowEvent>> {
+        self.with_state(|state| {
+            find_workflow(state, id)?;
+            Ok(state
+                .workflow_events
+                .iter()
+                .filter(|event| event.workflow_id == id && event.seq > after_seq)
+                .take(limit.clamp(1, 500))
+                .cloned()
+                .collect())
+        })
+    }
+
+    pub fn workflow_events_tail(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WorkflowEvent>> {
+        self.with_state(|state| {
+            find_workflow(state, id)?;
+            let events = state
+                .workflow_events
+                .iter()
+                .filter(|event| event.workflow_id == id)
+                .cloned()
+                .collect::<Vec<_>>();
+            Ok(events[events.len().saturating_sub(limit.clamp(1, 500))..].to_vec())
+        })
+    }
+
+    pub fn merge_conflict_preview(
+        &self,
+        id: &str,
+        file: &str,
+    ) -> anyhow::Result<MergeConflictPreview> {
+        let state = self.read_state()?;
+        let workflow = state
+            .workflows
+            .iter()
+            .find(|workflow| workflow.id == id)
+            .with_context(|| format!("工作流不存在：{id}"))?;
+        worktree::preview_conflict(workflow, file)
+    }
+
+    pub(super) fn append_workflow_event(
+        &self,
+        workflow_id: &str,
+        kind: &str,
+        task_id: &str,
+        role: &str,
+        message: &str,
+        data: Value,
+    ) -> anyhow::Result<u64> {
+        self.with_state(|state| {
+            find_workflow(state, workflow_id)?;
+            Ok(append_event_to_state(
+                state,
+                workflow_id,
+                kind,
+                task_id,
+                role,
+                message,
+                data,
+            ))
+        })
+    }
+
+    pub(super) fn insert_workflow(&self, workflow: WorkflowRecord) -> anyhow::Result<WorkflowRecord> {
+        self.with_state(|state| {
+            if state.workflows.len() >= MAX_WORKFLOWS {
+                bail!("三省工作流记录已达到 {MAX_WORKFLOWS} 条上限");
+            }
+            if state.workflows.iter().any(|item| item.id == workflow.id) {
+                bail!("工作流 ID 已存在");
+            }
+            state.workflows.push(workflow.clone());
+            append_event_to_state(
+                state,
+                &workflow.id,
+                "workflow_created",
+                "",
+                "",
+                "三省工作流已创建",
+                json!({"plannerAgentId": workflow.planner_agent_id,
+                    "reviewerAgentId": workflow.reviewer_agent_id,
+                    "executorAgentId": workflow.executor_agent_id}),
+            );
+            Ok(workflow)
+        })
+    }
+
+    /// Claim a workflow before starting its driver. An empty, matching, or
+    /// expired owner may take over; this prevents duplicate drivers after a
+    /// restart.
+    pub(super) fn claim_workflow(
+        &self,
+        id: &str,
+        owner_id: &str,
+        lease_ms: u64,
+    ) -> anyhow::Result<bool> {
+        self.with_state(|state| {
+            let timestamp = now_ms();
+            let workflow = find_workflow(state, id)?;
+            if workflow.phase.is_terminal() || workflow.cancel_requested {
+                return Ok(false);
+            }
+            if !workflow.owner_id.is_empty()
+                && workflow.owner_id != owner_id
+                && workflow.lease_until_ms > timestamp
+            {
+                return Ok(false);
+            }
+            workflow.owner_id = owner_id.to_string();
+            workflow.lease_until_ms = timestamp.saturating_add(lease_ms);
+            workflow.updated_at_ms = timestamp;
+            Ok(true)
+        })
+    }
+
+    pub(super) fn renew_workflow(
+        &self,
+        id: &str,
+        owner_id: &str,
+        lease_ms: u64,
+    ) -> anyhow::Result<bool> {
+        self.with_state(|state| {
+            let timestamp = now_ms();
+            let workflow = find_workflow(state, id)?;
+            if workflow.owner_id != owner_id
+                || workflow.phase.is_terminal()
+                || workflow.cancel_requested
+            {
+                return Ok(false);
+            }
+            workflow.lease_until_ms = timestamp.saturating_add(lease_ms);
+            Ok(true)
+        })
+    }
+
+    pub(super) fn update_workflow<T>(
+        &self,
+        id: &str,
+        owner_id: &str,
+        change: impl FnOnce(&mut WorkflowRecord) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.with_state(|state| {
+            let workflow = find_workflow(state, id)?;
+            if workflow.owner_id != owner_id {
+                bail!("工作流已由其他执行进程接管");
+            }
+            let previous_phase = workflow.phase.clone();
+            if workflow.cancel_requested && !workflow.phase.is_terminal() {
+                workflow.phase = WorkflowPhase::Cancelled;
+                workflow.error = "工作流已取消".to_string();
+            }
+            workflow.updated_at_ms = now_ms();
+            let result = change(workflow)?;
+            let current_phase = workflow.phase.clone();
+            if current_phase != previous_phase {
+                let previous_phase_text = serde_json::to_value(&previous_phase)
+                    .ok()
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_default();
+                let current_phase_text = serde_json::to_value(&current_phase)
+                    .ok()
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_default();
+                append_event_to_state(
+                    state,
+                    id,
+                    "phase_changed",
+                    "",
+                    "",
+                    &format!("{previous_phase_text} -> {current_phase_text}"),
+                    json!({"from": previous_phase_text, "to": current_phase_text}),
+                );
+            }
+            Ok(result)
+        })
+    }
+
+    pub fn accept_workflow(
+        &self,
+        id: &str,
+        controller_id: &str,
+        approved: bool,
+        notes: &str,
+    ) -> anyhow::Result<WorkflowRecord> {
+        self.with_state(|state| {
+            let workflow = find_workflow(state, id)?;
+            if workflow.controller_id != controller_id {
+                bail!("工作流控制凭据不匹配");
+            }
+            if workflow.phase != WorkflowPhase::AwaitingAcceptance {
+                bail!("工作流当前不在待宰相验收阶段");
+            }
+            let has_auto_merge = workflow.plan.as_ref().is_some_and(|plan| {
+                plan.subtasks
+                    .iter()
+                    .any(|subtask| subtask.merge_mode.trim() == "auto")
+            });
+            workflow.phase = if !approved {
+                WorkflowPhase::Failed
+            } else if has_auto_merge {
+                WorkflowPhase::Merging
+            } else {
+                WorkflowPhase::Completed
+            };
+            workflow.owner_id.clear();
+            workflow.lease_until_ms = 0;
+            workflow.acceptance_notes = bounded_text(notes, 16 * 1024);
+            if !approved && workflow.error.is_empty() {
+                workflow.error = "宰相验收未通过".to_string();
+            }
+            workflow.updated_at_ms = now_ms();
+            Ok(workflow.clone())
+        })
+    }
+
+    pub fn retry_workflow_merge(
+        &self,
+        id: &str,
+        controller_id: &str,
+    ) -> anyhow::Result<WorkflowRecord> {
+        self.with_state(|state| {
+            let workflow = find_workflow(state, id)?;
+            if workflow.controller_id != controller_id {
+                bail!("工作流控制凭据不匹配");
+            }
+            if workflow.phase != WorkflowPhase::MergeConflict {
+                bail!("工作流当前不在合并冲突状态");
+            }
+            workflow.phase = WorkflowPhase::Merging;
+            workflow.error.clear();
+            workflow.merge_conflicts.clear();
+            workflow.merge_conflict_task_id.clear();
+            workflow.merge_conflict_previews.clear();
+            workflow.merge_summary = "已请求重新执行自动合并。".to_string();
+            workflow.owner_id.clear();
+            workflow.lease_until_ms = 0;
+            workflow.updated_at_ms = now_ms();
+            let updated = workflow.clone();
+            append_event_to_state(
+                state,
+                id,
+                "merge_retry_requested",
+                "",
+                "chancellor",
+                "已请求重新执行自动合并。",
+                serde_json::json!({}),
+            );
+            Ok(updated)
+        })
+    }
+
+    pub fn resolve_merge_conflict(
+        &self,
+        id: &str,
+        controller_id: &str,
+        file: &str,
+        choice: &str,
+        content: Option<&str>,
+    ) -> anyhow::Result<WorkflowRecord> {
+        if !matches!(choice, "ours" | "theirs" | "custom") {
+            bail!("冲突处理方式必须是 ours、theirs 或 custom");
+        }
+        if choice == "custom" && content.is_none() {
+            bail!("手工解决冲突时必须提供最终内容");
+        }
+        if content.is_some_and(|content| content.len() > 512 * 1024) {
+            bail!("手工合并内容不能超过 512 KiB");
+        }
+        self.with_state(|state| {
+            let workflow = find_workflow(state, id)?;
+            if workflow.controller_id != controller_id {
+                bail!("工作流控制凭据不匹配");
+            }
+            if workflow.phase != WorkflowPhase::MergeConflict {
+                bail!("工作流当前不在合并冲突状态");
+            }
+            if !workflow.merge_conflicts.iter().any(|item| item == file) {
+                bail!("文件不在当前冲突列表中：{file}");
+            }
+            if workflow.merge_conflict_task_id.trim().is_empty() {
+                bail!("当前冲突缺少子任务标识，无法记录处理方式");
+            }
+            let resolution_key = merge_conflict_key(&workflow.merge_conflict_task_id, file);
+            workflow
+                .merge_resolutions
+                .insert(resolution_key.clone(), choice.to_string());
+            if choice == "custom" {
+                workflow.merge_custom_contents.insert(
+                    resolution_key.clone(),
+                    content.unwrap_or_default().to_string(),
+                );
+            } else {
+                workflow.merge_custom_contents.remove(&resolution_key);
+            }
+            workflow.updated_at_ms = now_ms();
+            let updated = workflow.clone();
+            append_event_to_state(
+                state,
+                id,
+                "merge_conflict_resolved",
+                "",
+                "chancellor",
+                &format!("已记录 {file} 的冲突决定：{choice}"),
+                serde_json::json!({
+                    "file": file,
+                    "choice": choice,
+                    "subtaskId": &updated.merge_conflict_task_id,
+                    "resolutionKey": resolution_key
+                }),
+            );
+            Ok(updated)
+        })
+    }
+
+    pub fn cancel_workflow(
+        &self,
+        id: &str,
+        controller_id: &str,
+    ) -> anyhow::Result<WorkflowRecord> {
+        let task_ids = self.with_state(|state| {
+            let workflow = find_workflow(state, id)?;
+            if workflow.controller_id != controller_id {
+                bail!("工作流控制凭据不匹配");
+            }
+            if workflow.phase.is_terminal() {
+                return Ok(Vec::new());
+            }
+            workflow.cancel_requested = true;
+            workflow.phase = WorkflowPhase::Cancelled;
+            workflow.error = "工作流已由控制端取消".to_string();
+            workflow.updated_at_ms = now_ms();
+            let mut ids = Vec::new();
+            if !workflow.planner_task_id.is_empty() {
+                ids.push(workflow.planner_task_id.clone());
+            }
+            if !workflow.reviewer_task_id.is_empty() {
+                ids.push(workflow.reviewer_task_id.clone());
+            }
+            if !workflow.result_reviewer_task_id.is_empty() {
+                ids.push(workflow.result_reviewer_task_id.clone());
+            }
+            if !workflow.repair_task_id.is_empty() {
+                ids.push(workflow.repair_task_id.clone());
+            }
+            ids.extend(workflow.subtask_task_ids.values().cloned());
+            Ok(ids)
+        })?;
+        for task_id in task_ids {
+            if let Ok(task) = self.task(&task_id) {
+                if !is_terminal(&task.status) {
+                    let _ = self.cancel(&task_id);
+                }
+            }
+        }
+        self.workflow(id)
     }
 
     /// 事务内竞争唯一执行权，重复 spawn 不会重复运行同一任务；未轮到时返回 false。
@@ -666,6 +1345,7 @@ impl Store {
                 task.progress = match task.status.as_str() {
                     "completed" => "任务已完成",
                     "cancelled" => "任务已取消",
+                    "handed_off" => "任务已交付，等待结果",
                     _ => "任务失败",
                 }
                 .to_string();
@@ -745,7 +1425,9 @@ fn concurrency_limit(config: &CollaborationConfig, agent_id: &str) -> usize {
         .agents
         .iter()
         .find(|agent| agent.id == agent_id)
-        .map_or(DEFAULT_MAX_CONCURRENT_TASKS, |agent| agent.max_concurrent_tasks)
+        .map_or(DEFAULT_MAX_CONCURRENT_TASKS, |agent| {
+            agent.max_concurrent_tasks
+        })
         .max(1) as usize
 }
 
@@ -786,10 +1468,23 @@ fn queue_wait_is_current(task: &TaskRecord, ahead: usize, timestamp: u64) -> boo
 }
 
 fn parse_state(payload: Option<&str>) -> anyhow::Result<State> {
-    match payload {
+    let mut state = match payload {
         Some(payload) => serde_json::from_str(payload).context("协作记录损坏，未覆盖现有数据"),
         None => Ok(State::default()),
+    }?;
+    // Existing installations must see newly shipped adapters before their first
+    // save; otherwise the manager only renders the old agent cards.
+    for agent in CollaborationConfig::default().agents {
+        if !state
+            .config
+            .agents
+            .iter()
+            .any(|existing| existing.id == agent.id)
+        {
+            state.config.agents.push(agent);
+        }
     }
+    Ok(state)
 }
 
 fn queue_progress(ahead: usize) -> String {
@@ -808,15 +1503,23 @@ fn find_task<'a>(state: &'a mut State, id: &str) -> anyhow::Result<&'a mut TaskR
         .context("找不到协作任务")
 }
 
+fn find_workflow<'a>(state: &'a mut State, id: &str) -> anyhow::Result<&'a mut WorkflowRecord> {
+    state
+        .workflows
+        .iter_mut()
+        .find(|workflow| workflow.id == id)
+        .context("找不到三省工作流")
+}
+
 fn normalize_config(config: CollaborationConfig) -> anyhow::Result<CollaborationConfig> {
     let mut normalized = CollaborationConfig::default();
     normalized.enabled = config.enabled;
     normalized.default_agent_id = config.default_agent_id.trim().to_string();
     if !matches!(
         normalized.default_agent_id.as_str(),
-        "codex" | "deepseek" | "claude"
+        "codex" | "deepseek" | "claude" | "workbuddy" | "trae"
     ) {
-        bail!("默认子 Agent 必须是 Codex、DeepSeek Harness 或 Claude Code");
+        bail!("默认子 Agent 必须是 Codex、DeepSeek Harness、Claude Code、WorkBuddy 或 Trae CN");
     }
     if !(1..=MAX_RUNTIME_MINUTES_LIMIT).contains(&config.max_runtime_minutes) {
         bail!("子 Agent 运行上限必须在 1 到 {MAX_RUNTIME_MINUTES_LIMIT} 分钟之间");
@@ -856,6 +1559,20 @@ fn normalize_config(config: CollaborationConfig) -> anyhow::Result<Collaboration
         }
         if agent.id == "deepseek" {
             parse_deepseek_model(&agent.model)?;
+        }
+        if agent.id == "workbuddy"
+            && !agent.model.is_empty()
+            && !matches!(
+                agent.model.as_str(),
+                "hy3" | "hy4-preview" | "glm-5.3-flash"
+            )
+        {
+            bail!(
+                "WorkBuddy 模型只支持 hy3、hy4-preview 或 glm-5.3-flash；留空使用自动路由"
+            );
+        }
+        if agent.id == "trae" && !agent.model.is_empty() {
+            bail!("Trae CN 的模型由 Trae 窗口选择；请清空模型字段");
         }
         if !(1..=MAX_CONCURRENT_TASKS_LIMIT).contains(&agent.max_concurrent_tasks) {
             bail!("同一 Agent 同时执行的任务数必须在 1 到 {MAX_CONCURRENT_TASKS_LIMIT} 之间");

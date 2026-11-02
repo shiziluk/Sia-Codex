@@ -286,6 +286,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             agent_collaboration_commands::agent_collaboration_request,
+            agent_collaboration_commands::agent_collaboration_events,
+            agent_collaboration_commands::agent_collaboration_conflict_preview,
+            agent_collaboration_commands::agent_collaboration_event_stream,
             commands::backend_version,
             commands::startup_options,
             commands::consume_pending_manager_navigation,

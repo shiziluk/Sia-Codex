@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use codex_plus_core::agent_collaboration::{
-    CollaborationConfig, Store, TaskRequest, executor, integration, mcp, native_refresh,
+    CollaborationConfig, Store, TaskRequest, WorkflowPhase, executor, integration, mcp,
+    native_refresh, pipeline, protocol, sse,
 };
 use codex_plus_core::settings::SettingsStore;
 use serde_json::{Value, json};
@@ -25,12 +26,13 @@ pub async fn agent_collaboration_request(
     }
     let refresh_requested = matches!(action.as_str(), "connect_codex" | "refresh_codex");
     let task_store = store.clone();
-    let (mut snapshot, task_id, debug_ports) =
+    let (mut snapshot, task_id, workflow_id, debug_ports) =
         tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
             let payload = payload.unwrap_or(Value::Null);
             let executable = std::env::current_exe().context("无法定位子 Agent MCP 程序")?;
             let home = codex_plus_core::codex_home::default_codex_home_dir();
             let state_dir = codex_plus_core::paths::default_app_state_dir();
+            let mut workflow_id = None;
             let task_id = match action.as_str() {
                 "snapshot" => None,
                 "refresh_codex" => {
@@ -61,6 +63,98 @@ pub async fn agent_collaboration_request(
                     store.cancel(id)?;
                     None
                 }
+                "sansheng_dispatch" => {
+                    let workflow: pipeline::NewWorkflow =
+                        serde_json::from_value(payload).context("三省工作流参数格式无效")?;
+                    let created = pipeline::create_workflow(&store, workflow)?;
+                    workflow_id = Some(created.id);
+                    None
+                }
+                "sansheng_accept" => {
+                    let requested_workflow_id = payload
+                        .get("workflowId")
+                        .and_then(Value::as_str)
+                        .context("缺少 workflowId")?;
+                    let controller_id = payload
+                        .get("controllerId")
+                        .and_then(Value::as_str)
+                        .context("缺少 controllerId")?;
+                    let approved = payload
+                        .get("approved")
+                        .and_then(Value::as_bool)
+                        .context("缺少 approved")?;
+                    let notes = payload
+                        .get("notes")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let accepted = store.accept_workflow(
+                        requested_workflow_id,
+                        controller_id,
+                        approved,
+                        notes,
+                    )?;
+                    if accepted.phase == WorkflowPhase::Merging {
+                        workflow_id = Some(accepted.id);
+                    }
+                    None
+                }
+                "sansheng_cancel" => {
+                    let workflow_id = payload
+                        .get("workflowId")
+                        .and_then(Value::as_str)
+                        .context("缺少 workflowId")?;
+                    let controller_id = payload
+                        .get("controllerId")
+                        .and_then(Value::as_str)
+                        .context("缺少 controllerId")?;
+                    store.cancel_workflow(workflow_id, controller_id)?;
+                    None
+                }
+                "sansheng_resolve_conflict" => {
+                    let workflow_id = payload
+                        .get("workflowId")
+                        .and_then(Value::as_str)
+                        .context("缺少 workflowId")?;
+                    let controller_id = payload
+                        .get("controllerId")
+                        .and_then(Value::as_str)
+                        .context("缺少 controllerId")?;
+                    let file = payload
+                        .get("file")
+                        .and_then(Value::as_str)
+                        .context("缺少 file")?;
+                    let choice = payload
+                        .get("choice")
+                        .and_then(Value::as_str)
+                        .context("缺少 choice")?;
+                    let content = payload.get("content").and_then(Value::as_str);
+                    store.resolve_merge_conflict(
+                        workflow_id,
+                        controller_id,
+                        file,
+                        choice,
+                        content,
+                    )?;
+                    None
+                }
+                "sansheng_retry_merge" => {
+                    let requested_workflow_id = payload
+                        .get("workflowId")
+                        .and_then(Value::as_str)
+                        .context("缺少 workflowId")?;
+                    let controller_id = payload
+                        .get("controllerId")
+                        .and_then(Value::as_str)
+                        .context("缺少 controllerId")?;
+                    let retried = store.retry_workflow_merge(
+                        requested_workflow_id,
+                        controller_id,
+                    )?;
+                    if retried.phase == WorkflowPhase::Merging {
+                        workflow_id = Some(retried.id);
+                    }
+                    None
+                }
                 _ => bail!("不支持的协作操作"),
             };
             let mut snapshot = store.snapshot()?;
@@ -70,13 +164,16 @@ pub async fn agent_collaboration_request(
             } else {
                 Vec::new()
             };
-            Ok((snapshot, task_id, debug_ports))
+            Ok((snapshot, task_id, workflow_id, debug_ports))
         })
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
     if let Some(task_id) = task_id {
-        executor::spawn_task(task_store, task_id);
+        executor::spawn_task(task_store.clone(), task_id);
+    }
+    if let Some(workflow_id) = workflow_id {
+        pipeline::spawn_workflow(task_store, workflow_id);
     }
     if refresh_requested {
         snapshot["runtime"] =
@@ -84,6 +181,55 @@ pub async fn agent_collaboration_request(
                 .map_err(|_| "无法读取 Codex MCP 刷新结果".to_string())?;
     }
     Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn agent_collaboration_events(
+    workflow_id: String,
+    after_seq: Option<u64>,
+    limit: Option<usize>,
+    tail: Option<bool>,
+) -> Result<Value, String> {
+    let store = Store::default();
+    let after_seq = after_seq.unwrap_or(0);
+    let limit = limit.unwrap_or(100);
+    let events = if tail.unwrap_or(false) {
+        store.workflow_events_tail(&workflow_id, limit)
+    } else {
+        store.workflow_events(&workflow_id, after_seq, limit)
+    }
+    .map_err(|error| error.to_string())?;
+    let next_seq = events.last().map(|event| event.seq).unwrap_or(after_seq);
+    Ok(json!({
+        "protocol": protocol::PROTOCOL_VERSION,
+        "workflowId": workflow_id,
+        "afterSeq": after_seq,
+        "nextSeq": next_seq,
+        "events": events,
+    }))
+}
+
+#[tauri::command]
+pub fn agent_collaboration_conflict_preview(
+    workflow_id: String,
+    file: String,
+) -> Result<Value, String> {
+    serde_json::to_value(
+        Store::default()
+            .merge_conflict_preview(&workflow_id, &file)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn agent_collaboration_event_stream() -> Result<Value, String> {
+    serde_json::to_value(
+        sse::ensure_endpoint(Store::default())
+            .await
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// 本实例状态、常规安装状态和标准端口；实际操作前仍严格验证 Codex 页面身份。

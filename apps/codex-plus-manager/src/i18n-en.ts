@@ -502,6 +502,12 @@ export const EN_PLAIN: Record<string, string> = {
   "请先检查更新并选择可下载的 Release asset。": "Check for updates first and select a downloadable release asset.",
   "关闭更新提示": "Close update notification",
   "也可随时在“关于”页面检查和安装更新。": "You can also check for and install updates on the About page at any time.",
+  "仅提示上游版本；下游定制版手工移植变更": "Upstream version notices only; downstream builds port changes manually",
+  "仅提示，不自动安装": "notice only, no automatic install",
+  "本构建不会下载或启动上游安装包。检查更新只用于提示版本和 Release 变更。": "This build never downloads or launches upstream installers. Update checks only report versions and release notes.",
+  "下游定制版只提示上游版本，不会自动下载或安装。请审阅变更并在本地维护分支中手工移植。": "The downstream custom build only reports upstream versions and never downloads or installs them. Review the changes and port them manually on the local maintenance branch.",
+  "启动时自动检查上游更新": "Check upstream releases automatically",
+  "只联网检查并提示上游版本与 Release 变更，不下载或安装。关闭后仍可手动检查。": "Only checks online and reports upstream versions and release notes; never downloads or installs. Manual checks remain available when disabled.",
   "此版本暂未提供适用于当前系统的安装包。": "An installer for your system is not available for this version yet.",
   "立即更新": "Update now",
   "关闭提示": "Close",
@@ -2781,6 +2787,8 @@ export const EN_PLAIN: Record<string, string> = {
   "导入或添加供应商": "Import or add providers",
   "到「旧版供应商配置」添加供应商，或用「从第三方导入」导入 cc-switch 的供应商": "Go to Legacy provider settings to add a provider, or use Import from third party to import cc-switch providers",
   "这些供应商仍可在「多开」页悬停卡片编辑、删除；右上角「从第三方导入」可以继续导入 cc-switch 的供应商。": "You can still edit or delete these providers by hovering a card on the Multi-instance page; use Import from third party at the top right to import cc-switch providers.",
+  "WorkBuddy 起始模型": "WorkBuddy starting model",
+  "默认从 hy3 开始；凌晨自动把 hy4-preview 加入候选；两者额度都不可用时切到 glm-5.3-flash。WorkBuddy 是纯文字适配器。": "Starts with hy3; adds hy4-preview during early morning; falls back to glm-5.3-flash when both quotas are unavailable. WorkBuddy is a text-only adapter.",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.

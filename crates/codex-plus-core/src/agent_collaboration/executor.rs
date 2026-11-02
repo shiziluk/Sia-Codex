@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use chrono::{Local, Timelike};
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::{AgentConfig, MAX_OUTPUT_BYTES, MAX_PROMPT_BYTES, QueueTurn, Store, TaskRecord};
@@ -26,6 +27,10 @@ const MAX_STDERR_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ANSWER_BYTES: usize = MAX_OUTPUT_BYTES;
 const STDERR_TAIL_BYTES: usize = 8192;
 const MAX_PROGRESS_CHARS: usize = 1200;
+const TRAE_HEADLESS_CDP_PORT: u16 = 39222;
+const TRAE_HEADLESS_SCRIPT: &str = include_str!("trae_headless_chat.mjs");
+const WORKBUDDY_HEADLESS_CDP_PORT: u16 = 39223;
+const WORKBUDDY_HEADLESS_SCRIPT: &str = include_str!("workbuddy_headless_chat.mjs");
 
 struct OwnedTask {
     handle: tokio::task::JoinHandle<()>,
@@ -51,6 +56,8 @@ enum Provider {
     Codex,
     Claude,
     DeepSeek,
+    WorkBuddy,
+    Trae,
 }
 
 impl Provider {
@@ -59,6 +66,8 @@ impl Provider {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
             "deepseek" => Ok(Self::DeepSeek),
+            "workbuddy" => Ok(Self::WorkBuddy),
+            "trae" => Ok(Self::Trae),
             _ => bail!("不支持的协作 Agent：{id}"),
         }
     }
@@ -176,13 +185,33 @@ fn auto_detect_executable(provider: Provider, local_appdata: Option<&Path>) -> O
             Provider::DeepSeek => candidates.push(PathBuf::from(
                 "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
             )),
-            Provider::Claude => {}
+            Provider::Claude | Provider::WorkBuddy | Provider::Trae => {}
+        }
+    }
+    if let Some(local_appdata) = local_appdata {
+        match provider {
+            Provider::WorkBuddy => candidates.push(
+                local_appdata
+                    .join("CodexPlusPlus")
+                    .join("workbuddy-bridge")
+                    .join("workbuddy-mcp.mjs"),
+            ),
+            Provider::Trae => candidates.push(
+                local_appdata
+                    .join("Programs")
+                    .join("Trae CN")
+                    .join("bin")
+                    .join("trae-cn.cmd"),
+            ),
+            Provider::Codex | Provider::Claude | Provider::DeepSeek => {}
         }
     }
     let command = match provider {
         Provider::Codex => "codex",
         Provider::Claude => "claude",
         Provider::DeepSeek => "dsh",
+        Provider::WorkBuddy => "workbuddy",
+        Provider::Trae => "trae-cn",
     };
     if let Some(home) = directories::BaseDirs::new() {
         candidates.push(home.home_dir().join(".local/bin").join(command));
@@ -463,6 +492,38 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
     if !task.session_id.is_empty() {
         validate_session_id(&task.session_id)?;
     }
+    let runtime_limit = Duration::from_secs(u64::from(config.max_runtime_minutes) * 60);
+    if provider == Provider::WorkBuddy {
+        let candidates =
+            workbuddy_model_candidates(&agent.model, Local::now().hour());
+        let mut last_outcome = None;
+        for (index, model) in candidates.iter().enumerate() {
+            if index > 0 {
+                let progress = format!(
+                    "WorkBuddy 模型 {} 不可用或未返回正文，正在切换到 {model}",
+                    candidates[index - 1]
+                );
+                store.update_progress(&task.id, &progress)?;
+            }
+            let outcome =
+                run_workbuddy_headless(store, &task, &cwd, runtime_limit, model).await?;
+            if outcome.status == "completed"
+                || !is_workbuddy_retryable_error(&outcome.error)
+            {
+                return Ok(outcome);
+            }
+            last_outcome = Some(outcome);
+        }
+        return Ok(last_outcome.unwrap_or(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: "WorkBuddy 没有可用模型候选".to_string(),
+            session_id: String::new(),
+        }));
+    }
+    if provider == Provider::Trae {
+        return run_trae_headless(store, &task, &executable, &cwd, runtime_limit).await;
+    }
 
     let overlay = if provider == Provider::DeepSeek {
         super::dsh::prepare_overlay(store, &task, agent)?
@@ -491,8 +552,1540 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
     let child = command
         .spawn()
         .context("无法启动原生 CLI，请检查路径和执行权限")?;
-    let runtime_limit = Duration::from_secs(u64::from(config.max_runtime_minutes) * 60);
     supervise(store, &task, provider, child, runtime_limit).await
+}
+
+async fn run_workbuddy_headless(
+    store: &Store,
+    task: &TaskRecord,
+    cwd: &Path,
+    runtime_limit: Duration,
+    model: &str,
+) -> anyhow::Result<Outcome> {
+    let node = resolve_command("node").context("未找到 Node.js，无法启动 WorkBuddy 无窗口驱动")?;
+    let app = find_workbuddy_app()?;
+    let runtime_dir = workbuddy_headless_runtime_dir()?;
+    let script_path = runtime_dir.join("workbuddy-cdp-chat.mjs");
+    if std::fs::read_to_string(&script_path).ok().as_deref()
+        != Some(WORKBUDDY_HEADLESS_SCRIPT)
+    {
+        std::fs::write(&script_path, WORKBUDDY_HEADLESS_SCRIPT)
+            .context("无法写入 WorkBuddy 无窗口驱动脚本")?;
+    }
+    let safe_task_id: String = task
+        .id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let prompt_path = runtime_dir
+        .join("prompts")
+        .join(format!("{safe_task_id}.txt"));
+    std::fs::write(&prompt_path, &task.prompt)
+        .context("无法写入 WorkBuddy 无窗口任务提示词")?;
+
+    let port = WORKBUDDY_HEADLESS_CDP_PORT;
+    let already_running = cdp_port_open(port).await;
+    store.update_progress(
+        &task.id,
+        if already_running {
+            "正在无窗口创建 WorkBuddy 任务"
+        } else {
+            "正在启动无窗口 WorkBuddy"
+        },
+    )?;
+    spawn_workbuddy_headless_app(&app, cwd, port)?;
+    if !wait_for_cdp(port, Duration::from_secs(60)).await {
+        let _ = std::fs::remove_file(&prompt_path);
+        bail!("WorkBuddy 无窗口模式在 60 秒内没有启动本地调试端口");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    store.update_progress(&task.id, "无窗口 WorkBuddy 已就绪；正在提交任务")?;
+    let mut command = Command::new(node);
+    command
+        .arg(&script_path)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("WORKBUDDY_PROMPT_FILE", &prompt_path)
+        .env(
+            "WORKBUDDY_TIMEOUT_MS",
+            runtime_limit.as_millis().to_string(),
+        )
+        .env("WORKBUDDY_CDP_PORT", port.to_string())
+        .env("WORKBUDDY_MODEL", model)
+        .env("NODE_NO_WARNINGS", "1");
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&prompt_path);
+            return Err(error).context("无法启动 WorkBuddy 无窗口驱动");
+        }
+    };
+    let mut process_group = ProcessGroup::new(&child);
+    let stdout = child
+        .stdout
+        .take()
+        .context("无法读取 WorkBuddy 无窗口驱动输出")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("无法读取 WorkBuddy 无窗口驱动诊断输出")?;
+    let stdout_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stdout
+            .take(MAX_STDOUT_BYTES as u64)
+            .read_to_end(&mut output)
+            .await
+            .map(|_| output)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stderr
+            .take(MAX_STDERR_BYTES as u64)
+            .read_to_end(&mut output)
+            .await
+            .map(|_| output)
+    });
+
+    let deadline = tokio::time::Instant::now() + runtime_limit;
+    let mut last_touch = Instant::now();
+    let mut stopped = false;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("无法读取 WorkBuddy 无窗口驱动状态")? {
+            break Some(status);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            timed_out = true;
+            terminate(&mut child, &mut process_group).await;
+            break None;
+        }
+        if store.worker_should_stop(&task.id)? {
+            stopped = true;
+            terminate(&mut child, &mut process_group).await;
+            break None;
+        }
+        if last_touch.elapsed() >= Duration::from_secs(10) {
+            store.touch(&task.id)?;
+            last_touch = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    if !stopped && !timed_out {
+        process_group.disarm();
+    }
+    let stdout = stdout_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let stderr = stderr_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&prompt_path);
+
+    if stopped {
+        return Ok(stopped_outcome(
+            &task.session_id,
+            "WorkBuddy 无窗口任务已取消；后台 Agent 可能仍会完成当前请求",
+        ));
+    }
+    if timed_out {
+        return Ok(Outcome {
+            status: "handed_off",
+            answer: "WorkBuddy 的无窗口会话仍在后台运行；当前运行时限内未确认最终答复。"
+                .to_string(),
+            error: "WorkBuddy 无窗口驱动超时；该状态不代表任务成功".to_string(),
+            session_id: String::new(),
+        });
+    }
+
+    let status_text = status
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "未返回退出状态".to_string());
+    if !status.is_some_and(|status| status.success()) {
+        let diagnostic = if stderr.iter().all(u8::is_ascii_whitespace) {
+            &stdout
+        } else {
+            &stderr
+        };
+        return Ok(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: safe_text(
+                &format!(
+                    "WorkBuddy 无窗口执行失败（{status_text}）；{}",
+                    String::from_utf8_lossy(diagnostic).trim()
+                ),
+                1600,
+            ),
+            session_id: String::new(),
+        });
+    }
+
+    let payload: Value =
+        serde_json::from_slice(&stdout).context("无法解析 WorkBuddy 无窗口驱动的返回结果")?;
+    if payload.get("state").and_then(Value::as_str) == Some("quota-exhausted") {
+        return Ok(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: safe_text(
+                payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("WorkBuddy 模型额度已用完"),
+                1600,
+            ),
+            session_id: String::new(),
+        });
+    }
+    if payload.get("state").and_then(Value::as_str) != Some("completed") {
+        bail!("WorkBuddy 未返回明确完成结果");
+    }
+    let answer = payload
+        .get("answer")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if answer.is_empty() {
+        bail!("WorkBuddy 无窗口模式返回了空答复");
+    }
+    Ok(Outcome {
+        status: "completed",
+        answer: safe_text(answer, MAX_OUTPUT_BYTES),
+        error: String::new(),
+        session_id: String::new(),
+    })
+}
+
+fn workbuddy_model_candidates(
+    configured_model: &str,
+    local_hour: u32,
+) -> Vec<String> {
+    let configured = configured_model.trim();
+    let mut models = Vec::new();
+    let first = match configured {
+        "hy4-preview" => "hy4-preview",
+        "glm-5.3-flash" => "glm-5.3-flash",
+        _ => "hy3",
+    };
+    models.push(first.to_string());
+    if first == "hy3" && local_hour < 6 {
+        models.push("hy4-preview".to_string());
+    }
+    if first != "glm-5.3-flash" {
+        models.push("glm-5.3-flash".to_string());
+    }
+    models
+}
+
+fn is_workbuddy_retryable_error(error: &str) -> bool {
+    let text = error.to_lowercase();
+    let quota_exhausted = [
+        "quota",
+        "rate limit",
+        "rate_limit",
+        "insufficient",
+        "credit",
+        "额度",
+        "免费次数",
+        "余额不足",
+        "次数已用完",
+        "达到上限",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    let empty_answer = text.contains("empty-answer") || text.contains("empty answer");
+    quota_exhausted || empty_answer
+}
+
+fn workbuddy_headless_runtime_dir() -> anyhow::Result<PathBuf> {
+    let root = std::env::var_os("CODEX_PLUS_WORKBUDDY_RUNTIME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            crate::paths::default_app_state_dir()
+                .join("agent-collaboration")
+                .join("workbuddy-headless")
+        });
+    std::fs::create_dir_all(root.join("prompts"))
+        .context("无法创建 WorkBuddy 无窗口运行目录")?;
+    Ok(root)
+}
+
+fn find_workbuddy_app() -> anyhow::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("WORKBUDDY_EXE").map(PathBuf::from)
+        && path.is_file()
+    {
+        return Ok(path);
+    }
+    let mut candidates = Vec::new();
+    for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        if let Some(root) = std::env::var_os(variable) {
+            candidates.push(
+                PathBuf::from(root.clone())
+                    .join("Programs")
+                    .join("WorkBuddy")
+                    .join("WorkBuddy.exe"),
+            );
+            candidates.push(
+                PathBuf::from(root)
+                    .join("WorkBuddy")
+                    .join("WorkBuddy.exe"),
+            );
+        }
+    }
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        return Ok(path);
+    }
+
+    #[cfg(windows)]
+    {
+        for key in [
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ] {
+            let Ok(output) = std::process::Command::new("reg.exe")
+                .args(["query", key, "/s", "/f", "WorkBuddy", "/d"])
+                .output()
+            else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines().filter(|line| line.contains("DisplayIcon")) {
+                let Some((_, value)) = line.split_once("REG_SZ") else {
+                    continue;
+                };
+                let value = value.trim().trim_end_matches(",0");
+                let path = PathBuf::from(value);
+                if path.is_file() {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+    bail!("未找到 WorkBuddy 主程序；请设置 WORKBUDDY_EXE")
+}
+
+fn spawn_workbuddy_headless_app(
+    app: &Path,
+    cwd: &Path,
+    port: u16,
+) -> anyhow::Result<()> {
+    let mut command = Command::new(app);
+    command
+        .arg("--headless")
+        .arg("--disable-gpu")
+        .arg(format!("--remote-debugging-port={port}"))
+        .arg("--remote-allow-origins=*")
+        .arg("--window-position=-32000,-32000")
+        .arg("--window-size=1,1")
+        .arg(cwd)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    command
+        .spawn()
+        .context("无法启动 WorkBuddy 无窗口模式")?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn run_workbuddy(
+    store: &Store,
+    task: &TaskRecord,
+    bridge: &Path,
+    cwd: &Path,
+    runtime_limit: Duration,
+    configured_model: &str,
+) -> anyhow::Result<Outcome> {
+    let node = resolve_command("node").context("未找到 Node.js，无法启动 WorkBuddy MCP 桥接")?;
+    let model = if configured_model.is_empty() {
+        "hy3"
+    } else {
+        configured_model
+    };
+    let bridge_timeout = runtime_limit.as_secs().clamp(10, 900);
+    let mut command = Command::new(node);
+    command
+        .arg(bridge)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .context("无法启动 WorkBuddy MCP 桥接，请检查 Node.js 和桥接脚本")?;
+    let mut process_group = ProcessGroup::new(&child);
+    let mut stdout = BufReader::new(child.stdout.take().context("无法读取 WorkBuddy 输出")?);
+    let stderr_pipe = child.stderr.take().context("无法读取 WorkBuddy 诊断输出")?;
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = stderr_pipe.take(MAX_STDERR_BYTES as u64);
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).await.map(|_| output)
+    });
+    let mut stdin = child.stdin.take().context("无法写入 WorkBuddy 输入")?;
+    let requests = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "codex-plus-orchestrator", "version": env!("CARGO_PKG_VERSION")}
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "ask_workbuddy",
+                "arguments": {
+                    "prompt": task.prompt,
+                    "model": model,
+                    "timeoutSeconds": bridge_timeout
+                }
+            }
+        }),
+    ];
+    let mut payload = String::new();
+    for request in requests {
+        payload.push_str(&serde_json::to_string(&request)?);
+        payload.push('\n');
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        stdin.write_all(payload.as_bytes()).await?;
+        stdin.shutdown().await
+    })
+    .await
+    .context("写入 WorkBuddy MCP 请求超时")?
+    .context("无法写入 WorkBuddy MCP 请求")?;
+
+    let deadline = tokio::time::Instant::now() + runtime_limit;
+    let mut tick = tokio::time::interval(Duration::from_millis(300));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_touch = Instant::now();
+    let mut line = String::new();
+    let (result, stop_error) = loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                break (None, Some(format!(
+                    "WorkBuddy 任务超过 {} 分钟上限，已终止桥接",
+                    (runtime_limit.as_secs() / 60).max(1)
+                )));
+            }
+            _ = tick.tick() => {
+                if store.worker_should_stop(&task.id)? {
+                    break (None, Some("WorkBuddy 任务已取消或 Agent 已停用".to_string()));
+                }
+                if last_touch.elapsed() >= Duration::from_secs(10) {
+                    store.touch(&task.id)?;
+                    last_touch = Instant::now();
+                }
+            }
+            read = stdout.read_line(&mut line) => {
+                let count = read.context("读取 WorkBuddy MCP 输出失败")?;
+                if count == 0 {
+                    break (None, Some("WorkBuddy MCP 桥接在返回结果前退出".to_string()));
+                }
+                if line.len() > MAX_LINE_BYTES {
+                    break (None, Some("WorkBuddy MCP 响应超过单行限制".to_string()));
+                }
+                let message: Value = serde_json::from_str(line.trim())
+                    .context("WorkBuddy MCP 返回了无效 JSON")?;
+                line.clear();
+                if message.get("id").and_then(Value::as_u64) == Some(2) {
+                    break (Some(message), None);
+                }
+            }
+        }
+    };
+
+    terminate(&mut child, &mut process_group).await;
+    let stderr = stderr_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    if let Some(message) = result {
+        let answer = workbuddy_answer(&message).map_err(anyhow::Error::msg)?;
+        return Ok(Outcome {
+            status: "completed",
+            answer,
+            error: String::new(),
+            session_id: String::new(),
+        });
+    }
+    let stderr_text = String::from_utf8_lossy(&stderr);
+    let detail = stop_error.unwrap_or_else(|| "WorkBuddy 未返回结果".to_string());
+    Ok(Outcome {
+        status: "failed",
+        answer: String::new(),
+        error: if stderr_text.trim().is_empty() {
+            safe_text(&detail, 1600)
+        } else {
+            safe_text(&format!("{detail}；诊断：{}", stderr_text.trim()), 1600)
+        },
+        session_id: String::new(),
+    })
+}
+
+fn workbuddy_answer(message: &Value) -> Result<String, String> {
+    if let Some(error) = message.get("error") {
+        return Err(format!(
+            "WorkBuddy MCP 错误：{}",
+            error_text(error, "未知错误")
+        ));
+    }
+    let result = message
+        .get("result")
+        .ok_or_else(|| "WorkBuddy MCP 响应缺少 result".to_string())?;
+    let content = result
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "WorkBuddy MCP 响应缺少 content".to_string())?;
+    let text = content
+        .iter()
+        .filter(|item| item["type"] == "text")
+        .filter_map(|item| item["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        return Err("WorkBuddy 没有返回可见文本".to_string());
+    }
+    if result["isError"] == true {
+        return Err(safe_text(text.trim(), 1600));
+    }
+    if text.len() > MAX_ANSWER_BYTES {
+        return Err("WorkBuddy 输出超过 256 KiB 限制".to_string());
+    }
+    Ok(text.trim().to_string())
+}
+
+async fn run_trae_headless(
+    store: &Store,
+    task: &TaskRecord,
+    executable: &Path,
+    cwd: &Path,
+    runtime_limit: Duration,
+) -> anyhow::Result<Outcome> {
+    let node = resolve_command("node").context("未找到 Node.js，无法启动 Trae 无窗口驱动")?;
+    let (app, cli) = trae_launch_paths(executable)?;
+    let install_root = app
+        .parent()
+        .context("Trae 可执行文件缺少安装目录")?;
+    let ws_module = install_root
+        .join("resources")
+        .join("app")
+        .join("node_modules")
+        .join("ws");
+    if !ws_module.is_dir() {
+        bail!("Trae 的 ws 模块不存在：{}", ws_module.display());
+    }
+
+    let runtime_dir = trae_headless_runtime_dir()?;
+    let script_path = runtime_dir.join("cdp-chat.mjs");
+    if std::fs::read_to_string(&script_path).ok().as_deref() != Some(TRAE_HEADLESS_SCRIPT) {
+        std::fs::write(&script_path, TRAE_HEADLESS_SCRIPT)
+            .context("无法写入 Trae 无窗口驱动脚本")?;
+    }
+    let safe_task_id: String = task
+        .id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let prompt_path = runtime_dir
+        .join("prompts")
+        .join(format!("{safe_task_id}.txt"));
+    std::fs::write(&prompt_path, &task.prompt).context("无法写入 Trae 无窗口任务提示词")?;
+
+    let port = TRAE_HEADLESS_CDP_PORT;
+    let already_running = cdp_port_open(port).await;
+    store.update_progress(
+        &task.id,
+        if already_running {
+            "正在无窗口切换 Trae CN 工作区"
+        } else {
+            "正在启动无窗口 Trae CN"
+        },
+    )?;
+    spawn_trae_headless_app(&app, cwd, port, already_running)?;
+    if !wait_for_cdp(port, Duration::from_secs(60)).await {
+        let _ = std::fs::remove_file(&prompt_path);
+        bail!("Trae CN 无窗口模式在 60 秒内没有启动本地调试端口");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if let Err(error) = prepare_trae_headless_page(&node, &script_path, &ws_module, port).await {
+        let _ = std::fs::remove_file(&prompt_path);
+        return Ok(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: safe_text(&format!("准备无窗口 Trae 工作区失败：{error}"), 1600),
+            session_id: String::new(),
+        });
+    }
+
+    store.update_progress(&task.id, "正在无窗口打开 Trae Agent 会话")?;
+    let opened = run_trae_cli_command(
+        store,
+        task,
+        &app,
+        &cli,
+        cwd,
+        vec![
+            "chat".to_string(),
+            "--reuse-window".to_string(),
+            "--mode".to_string(),
+            "agent".to_string(),
+            "Open Trae agent session".to_string(),
+        ],
+    )
+    .await?;
+    if opened.stopped {
+        let _ = std::fs::remove_file(&prompt_path);
+        return Ok(stopped_outcome(
+            &task.session_id,
+            "Trae Agent 会话打开阶段已取消",
+        ));
+    }
+    if opened.timed_out || !opened.success {
+        let _ = std::fs::remove_file(&prompt_path);
+        return Ok(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: trae_cli_failure("打开无窗口 Trae Agent 会话", &opened),
+            session_id: String::new(),
+        });
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    store.update_progress(&task.id, "无窗口 Trae CN 已就绪；正在提交 Agent 任务")?;
+    let mut command = Command::new(node);
+    command
+        .arg(&script_path)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("TRAE_CHAT_PROMPT_FILE", &prompt_path)
+        .env("TRAE_CHAT_TIMEOUT_MS", runtime_limit.as_millis().to_string())
+        .env("TRAE_CDP_PORT", port.to_string())
+        .env("TRAE_WS_MODULE_PATH", &ws_module)
+        .env("NODE_NO_WARNINGS", "1");
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&prompt_path);
+            return Err(error).context("无法启动 Trae 无窗口驱动");
+        }
+    };
+    let mut process_group = ProcessGroup::new(&child);
+    let stdout = child
+        .stdout
+        .take()
+        .context("无法读取 Trae 无窗口驱动输出")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("无法读取 Trae 无窗口驱动诊断输出")?;
+    let stdout_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stdout
+            .take(MAX_STDOUT_BYTES as u64)
+            .read_to_end(&mut output)
+            .await
+            .map(|_| output)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stderr
+            .take(MAX_STDERR_BYTES as u64)
+            .read_to_end(&mut output)
+            .await
+            .map(|_| output)
+    });
+
+    let deadline = tokio::time::Instant::now() + runtime_limit;
+    let mut last_touch = Instant::now();
+    let mut stopped = false;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("无法读取 Trae 无窗口驱动状态")? {
+            break Some(status);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            timed_out = true;
+            terminate(&mut child, &mut process_group).await;
+            break None;
+        }
+        if store.worker_should_stop(&task.id)? {
+            stopped = true;
+            terminate(&mut child, &mut process_group).await;
+            break None;
+        }
+        if last_touch.elapsed() >= Duration::from_secs(10) {
+            store.touch(&task.id)?;
+            last_touch = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    if !stopped && !timed_out {
+        process_group.disarm();
+    }
+    let stdout = stdout_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let stderr = stderr_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&prompt_path);
+
+    if stopped {
+        return Ok(stopped_outcome(
+            &task.session_id,
+            "Trae 无窗口任务已取消；后台 Agent 可能仍会完成当前请求",
+        ));
+    }
+    if timed_out {
+        return Ok(Outcome {
+            status: "handed_off",
+            answer: "Trae CN 的无窗口会话仍在后台运行；当前运行时限内未确认最终答复。"
+                .to_string(),
+            error: "Trae 无窗口驱动超时；该状态不代表任务成功".to_string(),
+            session_id: String::new(),
+        });
+    }
+
+    let status_text = status
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "未返回退出状态".to_string());
+    if !status.is_some_and(|status| status.success()) {
+        let diagnostic = if stderr.iter().all(u8::is_ascii_whitespace) {
+            &stdout
+        } else {
+            &stderr
+        };
+        return Ok(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: safe_text(
+                &format!(
+                    "Trae 无窗口执行失败（{status_text}）；{}",
+                    String::from_utf8_lossy(diagnostic).trim()
+                ),
+                1600,
+            ),
+            session_id: String::new(),
+        });
+    }
+
+    let payload: Value =
+        serde_json::from_slice(&stdout).context("无法解析 Trae 无窗口驱动的返回结果")?;
+    let answer = payload
+        .get("answer")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if answer.is_empty() {
+        bail!("Trae 无窗口模式返回了空答复");
+    }
+    Ok(Outcome {
+        status: "completed",
+        answer: safe_text(answer, MAX_OUTPUT_BYTES),
+        error: String::new(),
+        session_id: String::new(),
+    })
+}
+
+fn trae_headless_runtime_dir() -> anyhow::Result<PathBuf> {
+    let root = std::env::var_os("CODEX_PLUS_TRAE_RUNTIME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            crate::paths::default_app_state_dir()
+                .join("agent-collaboration")
+                .join("trae-headless")
+        });
+    std::fs::create_dir_all(root.join("prompts")).context("无法创建 Trae 无窗口运行目录")?;
+    Ok(root)
+}
+
+fn spawn_trae_headless_app(
+    app: &Path,
+    cwd: &Path,
+    port: u16,
+    reuse_window: bool,
+) -> anyhow::Result<()> {
+    let mut command = Command::new(app);
+    command
+        .arg("--headless")
+        .arg("--disable-gpu")
+        .arg(format!("--remote-debugging-port={port}"))
+        .arg("--remote-allow-origins=*")
+        .arg("--window-position=-32000,-32000")
+        .arg("--window-size=1,1");
+    if reuse_window {
+        command.arg("--reuse-window");
+    }
+    command
+        .arg(cwd)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    command
+        .spawn()
+        .context("无法启动 Trae CN 无窗口模式")?;
+    Ok(())
+}
+
+async fn cdp_port_open(port: u16) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(300),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+async fn wait_for_cdp(port: u16, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if cdp_port_open(port).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn prepare_trae_headless_page(
+    node: &Path,
+    script: &Path,
+    ws_module: &Path,
+    port: u16,
+) -> anyhow::Result<()> {
+    let mut command = Command::new(node);
+    command
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("TRAE_PREPARE_ONLY", "1")
+        .env("TRAE_CDP_PORT", port.to_string())
+        .env("TRAE_WS_MODULE_PATH", ws_module)
+        .env("NODE_NO_WARNINGS", "1");
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    #[cfg(unix)]
+    command.process_group(0);
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .context("Trae 无窗口页面准备超时")?
+        .context("无法运行 Trae 无窗口页面准备脚本")?;
+    if !output.status.success() {
+        let diagnostic = if output.stderr.iter().all(u8::is_ascii_whitespace) {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        bail!("{}", String::from_utf8_lossy(diagnostic).trim());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn run_trae(
+    store: &Store,
+    task: &TaskRecord,
+    executable: &Path,
+    cwd: &Path,
+    runtime_limit: Duration,
+) -> anyhow::Result<Outcome> {
+    let (app, cli) = trae_launch_paths(executable)?;
+    let result_dir = cwd.join(".codex-plus").join("trae-results");
+    std::fs::create_dir_all(&result_dir).context("无法创建 Trae 结果交接目录")?;
+    let result_path = result_dir.join(format!("{}.md", task.id));
+    if result_path.exists() {
+        bail!(
+            "Trae 结果交接文件已存在，拒绝覆盖：{}",
+            result_path.display()
+        );
+    }
+    let prompt = trae_handoff_prompt(&task.prompt, &result_path)?;
+    let deadline = tokio::time::Instant::now() + runtime_limit;
+
+    store.update_progress(&task.id, "正在打开 Trae CN 工作区")?;
+    let cwd_text = cwd.to_string_lossy().into_owned();
+    let opened = run_trae_cli_command(
+        store,
+        task,
+        &app,
+        &cli,
+        cwd,
+        vec!["--reuse-window".to_string(), cwd_text],
+    )
+    .await?;
+    if opened.stopped {
+        return Ok(stopped_outcome(
+            &task.session_id,
+            "Trae 工作区打开阶段已取消；已经打开的窗口不会自动关闭",
+        ));
+    }
+    if opened.timed_out || !opened.success {
+        return Ok(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: trae_cli_failure("打开 Trae 工作区", &opened),
+            session_id: String::new(),
+        });
+    }
+
+    for _ in 0..20 {
+        if store.worker_should_stop(&task.id)? {
+            return Ok(stopped_outcome(
+                &task.session_id,
+                "Trae 工作区加载阶段已取消；已经打开的窗口不会自动关闭",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    store.update_progress(&task.id, "Trae 工作区已打开；正在提交 Agent 任务")?;
+    if let Err(error) = submit_trae_prompt(cwd, &prompt).await {
+        return Ok(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: safe_text(&format!("提交 Trae Agent 任务失败：{error}"), 1600),
+            session_id: String::new(),
+        });
+    }
+
+    store.update_progress(
+        &task.id,
+        "Trae CN 已接收任务；等待 Agent 写入最终结果交接文件",
+    )?;
+    let mut last_touch = Instant::now();
+    let mut previous_size = 0_u64;
+    let mut stable_since = tokio::time::Instant::now();
+    loop {
+        if store.worker_should_stop(&task.id)? {
+            return Ok(stopped_outcome(
+                &task.session_id,
+                "Trae 任务已取消；已经打开的窗口不会自动关闭",
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(Outcome {
+                status: "handed_off",
+                answer: format!(
+                    "Trae CN 窗口已打开，但没有在 {} 分钟内检测到最终结果文件。\
+                     请查看 Trae 窗口确认任务是否完成；该状态不代表成功。",
+                    (runtime_limit.as_secs() / 60).max(1)
+                ),
+                error: format!(
+                    "未能自动确认 Trae 最终答复；期望结果文件：{}",
+                    result_path.display()
+                ),
+                session_id: String::new(),
+            });
+        }
+        if last_touch.elapsed() >= Duration::from_secs(10) {
+            store.touch(&task.id)?;
+            last_touch = Instant::now();
+        }
+        let size = std::fs::metadata(&result_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if size == 0 {
+            previous_size = 0;
+            stable_since = tokio::time::Instant::now();
+        } else if size != previous_size {
+            previous_size = size;
+            stable_since = tokio::time::Instant::now();
+        } else if stable_since.elapsed() >= Duration::from_millis(750) {
+            if size > MAX_ANSWER_BYTES as u64 {
+                let _ = std::fs::remove_file(&result_path);
+                return Ok(Outcome {
+                    status: "failed",
+                    answer: String::new(),
+                    error: "Trae 结果文件超过 256 KiB 限制，未保存不完整内容".to_string(),
+                    session_id: String::new(),
+                });
+            }
+            let answer =
+                std::fs::read_to_string(&result_path).context("无法读取 Trae 最终结果文件")?;
+            if answer.trim().is_empty() {
+                let _ = std::fs::remove_file(&result_path);
+                previous_size = 0;
+                stable_since = tokio::time::Instant::now();
+            } else {
+                let _ = std::fs::remove_file(&result_path);
+                return Ok(Outcome {
+                    status: "completed",
+                    answer: safe_text(answer.trim(), MAX_OUTPUT_BYTES),
+                    error: String::new(),
+                    session_id: String::new(),
+                });
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+struct TraeCliRun {
+    success: bool,
+    status: String,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stopped: bool,
+    timed_out: bool,
+}
+
+async fn run_trae_cli_command(
+    store: &Store,
+    task: &TaskRecord,
+    app: &Path,
+    cli: &Path,
+    cwd: &Path,
+    args: Vec<String>,
+) -> anyhow::Result<TraeCliRun> {
+    let mut command = Command::new(app);
+    command
+        .arg(cli)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("ELECTRON_RUN_AS_NODE", "1")
+        .env("VSCODE_DEV", "");
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .context("无法启动 Trae CN，请检查安装路径和执行权限")?;
+    let mut process_group = ProcessGroup::new(&child);
+    let stdout = child.stdout.take().context("无法读取 Trae 启动输出")?;
+    let stderr = child.stderr.take().context("无法读取 Trae 诊断输出")?;
+    let stdout_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stdout
+            .take(MAX_STDERR_BYTES as u64)
+            .read_to_end(&mut output)
+            .await
+            .map(|_| output)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stderr
+            .take(MAX_STDERR_BYTES as u64)
+            .read_to_end(&mut output)
+            .await
+            .map(|_| output)
+    });
+    let launch_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_touch = Instant::now();
+    let mut stopped = false;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("无法读取 Trae 启动状态")? {
+            break Some(status);
+        }
+        if tokio::time::Instant::now() >= launch_deadline {
+            timed_out = true;
+            terminate(&mut child, &mut process_group).await;
+            break None;
+        }
+        if store.worker_should_stop(&task.id)? {
+            stopped = true;
+            terminate(&mut child, &mut process_group).await;
+            break None;
+        }
+        tick.tick().await;
+        if last_touch.elapsed() >= Duration::from_secs(10) {
+            store.touch(&task.id)?;
+            last_touch = Instant::now();
+        }
+    };
+    if !stopped && !timed_out {
+        process_group.disarm();
+    }
+    let stdout = stdout_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let stderr = stderr_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let success = status.as_ref().is_some_and(|status| status.success());
+    let status = status
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| {
+            if timed_out {
+                "超过 60 秒未退出".to_string()
+            } else {
+                "已取消".to_string()
+            }
+        });
+    Ok(TraeCliRun {
+        success,
+        status,
+        stdout,
+        stderr,
+        stopped,
+        timed_out,
+    })
+}
+
+fn trae_cli_failure(stage: &str, run: &TraeCliRun) -> String {
+    let diagnostic = if run.stderr.iter().all(u8::is_ascii_whitespace) {
+        &run.stdout
+    } else {
+        &run.stderr
+    };
+    safe_text(
+        &format!(
+            "{stage}失败（{}）；{}",
+            run.status,
+            String::from_utf8_lossy(diagnostic).trim()
+        ),
+        1600,
+    )
+}
+
+async fn submit_trae_prompt(cwd: &Path, prompt: &str) -> anyhow::Result<()> {
+    let nuphus = nuphus_executable()?;
+    let windows = call_nuphus_tool(&nuphus, cwd, "desktop_windows_list", serde_json::json!({})).await?;
+    let window = trae_window_from_list(&windows, cwd)?;
+    let hwnd = window["hwnd"]
+        .as_i64()
+        .context("Trae 窗口缺少 hwnd")?;
+    call_nuphus_tool(
+        &nuphus,
+        cwd,
+        "desktop_window_move",
+        serde_json::json!({"hwnd": hwnd, "x": 320, "y": 0, "confirm": true}),
+    )
+    .await?;
+    call_nuphus_tool(
+        &nuphus,
+        cwd,
+        "desktop_window_resize",
+        serde_json::json!({"hwnd": hwnd, "width": 1500, "height": 900, "confirm": true}),
+    )
+    .await?;
+    set_trae_topmost(hwnd, true)?;
+    call_nuphus_tool(
+        &nuphus,
+        cwd,
+        "desktop_mouse",
+        serde_json::json!({
+            "action": "click",
+            "x": 370,
+            "y": 30,
+            "button": "left",
+            "clicks": 1,
+            "confirm": true
+        }),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    call_nuphus_tool(
+        &nuphus,
+        cwd,
+        "desktop_window_activate",
+        serde_json::json!({"hwnd": hwnd, "confirm": true}),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let windows = call_nuphus_tool(&nuphus, cwd, "desktop_windows_list", serde_json::json!({})).await?;
+    let window = trae_window_from_list(&windows, cwd)?;
+    let x = window["x"].as_i64().context("Trae 窗口缺少 x")?;
+    let y = window["y"].as_i64().context("Trae 窗口缺少 y")?;
+    let width = window["width"].as_i64().context("Trae 窗口缺少 width")?;
+    let height = window["height"].as_i64().context("Trae 窗口缺少 height")?;
+    let perception = call_nuphus_tool(
+        &nuphus,
+        cwd,
+        "desktop_perceive",
+        serde_json::json!({
+            "region": {"x": x, "y": y, "width": width, "height": height}
+        }),
+    )
+    .await?;
+    let (click_x, click_y) = trae_prompt_point(&perception, y, height)?;
+    call_nuphus_tool(
+        &nuphus,
+        cwd,
+        "desktop_mouse",
+        serde_json::json!({
+            "action": "click",
+            "x": click_x,
+            "y": click_y,
+            "button": "left",
+            "clicks": 1,
+            "confirm": true
+        }),
+    )
+    .await?;
+    call_nuphus_tool(
+        &nuphus,
+        cwd,
+        "desktop_input",
+        serde_json::json!({
+            "mode": "type",
+            "text": prompt,
+            "send": "enter",
+            "confirm": true
+        }),
+    )
+    .await?;
+    set_trae_topmost(hwnd, false)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_trae_topmost(hwnd: i64, topmost: bool) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+    if hwnd <= 0 {
+        bail!("Trae 窗口句柄无效");
+    }
+    let after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    unsafe {
+        SetWindowPos(
+            HWND(hwnd as *mut core::ffi::c_void),
+            after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_trae_topmost(_hwnd: i64, _topmost: bool) -> anyhow::Result<()> {
+    bail!("Trae UI 自动提交目前仅支持 Windows")
+}
+
+fn nuphus_executable() -> anyhow::Result<PathBuf> {
+    if let Some(configured) = std::env::var_os("CODEX_PLUS_NUPHUS_MCP") {
+        let path = PathBuf::from(configured);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    let appdata = std::env::var_os("APPDATA").context("未找到 APPDATA，无法定位 Nuphus MCP")?;
+    let path = PathBuf::from(appdata)
+        .join("npm")
+        .join("node_modules")
+        .join("@nuphus")
+        .join("nuphus-mcp")
+        .join("node_modules")
+        .join("@nuphus")
+        .join("nuphus-mcp-win32-x64")
+        .join("bin")
+        .join("nuphus-mcp.exe");
+    path.is_file()
+        .then_some(path)
+        .context("Trae UI 控制需要本机 Nuphus MCP；未找到 nuphus-mcp.exe")
+}
+
+fn trae_window_from_list(value: &Value, cwd: &Path) -> anyhow::Result<Value> {
+    let workspace = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let windows = value.as_array().context("Nuphus 窗口列表格式无效")?;
+    let workspace_matches = windows
+        .iter()
+        .filter(|window| {
+            window["title"]
+                .as_str()
+                .is_some_and(|title| {
+                    !workspace.is_empty() && title.to_ascii_lowercase().contains(&workspace)
+                })
+                && window["visible"].as_bool().unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let matches = if workspace_matches.is_empty() {
+        windows
+            .iter()
+            .filter(|window| {
+                window["title"]
+                    .as_str()
+                    .is_some_and(|title| title.to_ascii_lowercase().contains("trae cn"))
+                    && window["visible"].as_bool().unwrap_or(false)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        workspace_matches
+    };
+    matches
+        .into_iter()
+        .max_by_key(|window| {
+            window["width"].as_i64().unwrap_or(0) * window["height"].as_i64().unwrap_or(0)
+        })
+        .cloned()
+        .context("未找到 Trae CN 工作区窗口")
+}
+
+fn trae_prompt_point(perception: &Value, window_y: i64, window_height: i64) -> anyhow::Result<(i64, i64)> {
+    let elements = perception["elements"]
+        .as_array()
+        .context("Nuphus 窗口识别结果缺少 elements")?;
+    let by_text = elements
+        .iter()
+        .find_map(|element| {
+            let text = element["text"].as_str()?.to_ascii_lowercase();
+            let matches = text.contains("添加上下文")
+                || text.contains("使用命令和技能")
+                || text.contains("add context")
+                || text.contains("use commands");
+            if !matches {
+                return None;
+            }
+            Some((
+                element["center"]["x"].as_i64()?,
+                element["center"]["y"].as_i64()?,
+            ))
+        });
+    if let Some(point) = by_text {
+        return Ok(point);
+    }
+    let lower_bound = window_y + window_height * 65 / 100;
+    elements
+        .iter()
+        .filter(|element| {
+            element["kind"] == "input"
+                && element["center"]["y"].as_i64().unwrap_or(0) >= lower_bound
+        })
+        .max_by_key(|element| element["rect"]["w"].as_i64().unwrap_or(0))
+        .and_then(|element| {
+            Some((
+                element["center"]["x"].as_i64()?,
+                element["center"]["y"].as_i64()?,
+            ))
+        })
+        .context("无法识别 Trae Agent 输入框")
+}
+
+async fn call_nuphus_tool(
+    executable: &Path,
+    cwd: &Path,
+    name: &str,
+    arguments: Value,
+) -> anyhow::Result<Value> {
+    let mut command = Command::new(executable);
+    command
+        .arg("--confirm-write")
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().context("无法启动 Nuphus MCP")?;
+    let mut process_group = ProcessGroup::new(&child);
+    let mut stdin = child.stdin.take().context("无法写入 Nuphus MCP")?;
+    let mut stdout = BufReader::new(child.stdout.take().context("无法读取 Nuphus MCP")?);
+    let stderr_pipe = child.stderr.take().context("无法读取 Nuphus MCP 诊断")?;
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = stderr_pipe.take(MAX_STDERR_BYTES as u64);
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).await.map(|_| output)
+    });
+    let requests = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "codex-plus-trae-driver", "version": env!("CARGO_PKG_VERSION")}
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }),
+    ];
+    let mut payload = String::new();
+    for request in requests {
+        payload.push_str(&serde_json::to_string(&request)?);
+        payload.push('\n');
+    }
+    stdin.write_all(payload.as_bytes()).await?;
+    stdin.shutdown().await?;
+
+    let mut line = String::new();
+    let response = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            line.clear();
+            let count = stdout.read_line(&mut line).await?;
+            if count == 0 {
+                bail!("Nuphus MCP 在返回结果前退出");
+            }
+            let message: Value = serde_json::from_str(line.trim())?;
+            if message.get("id").and_then(Value::as_u64) == Some(2) {
+                return Ok::<Value, anyhow::Error>(message);
+            }
+        }
+    })
+    .await
+    .context("Nuphus MCP 调用超过 60 秒")??;
+    terminate(&mut child, &mut process_group).await;
+    let stderr = stderr_task.await.ok().and_then(Result::ok).unwrap_or_default();
+    if let Some(error) = response.get("error") {
+        bail!("Nuphus MCP 错误：{}", error_text(error, "未知错误"));
+    }
+    let result = response
+        .get("result")
+        .context("Nuphus MCP 响应缺少 result")?;
+    if result["isError"] == true {
+        let message = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or("Nuphus MCP 工具执行失败");
+        bail!("{}", safe_text(message, 1600));
+    }
+    let text = result["content"][0]["text"]
+        .as_str()
+        .context("Nuphus MCP 响应缺少文本结果")?;
+    if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+        Ok(parsed)
+    } else if stderr.is_empty() {
+        Ok(Value::String(text.to_string()))
+    } else {
+        Ok(Value::String(text.to_string()))
+    }
+}
+
+fn trae_launch_paths(executable: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let root = if executable
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+    {
+        executable
+            .parent()
+            .and_then(Path::parent)
+            .context("Trae CLI 路径缺少安装目录")?
+            .to_path_buf()
+    } else {
+        executable
+            .parent()
+            .context("Trae 可执行文件路径缺少安装目录")?
+            .to_path_buf()
+    };
+    let app = root.join("Trae CN.exe");
+    let cli = root
+        .join("resources")
+        .join("app")
+        .join("out")
+        .join("cli.js");
+    if !app.is_file() {
+        bail!("未找到 Trae CN 主程序：{}", app.display());
+    }
+    if !cli.is_file() {
+        bail!("未找到 Trae CLI 入口：{}", cli.display());
+    }
+    Ok((app, cli))
+}
+
+fn trae_handoff_prompt(prompt: &str, result_path: &Path) -> anyhow::Result<String> {
+    let result_path = result_path.to_string_lossy();
+    let handoff = format!(
+        "\n\n[Codex++ orchestration handoff]\n\
+         在完成任务后，必须把最终答复以 UTF-8 文本写入下面这个精确路径：\n\
+         `{result_path}`\n\
+         该文件是 Codex++ 读取异步结果的唯一交接文件。请确保文件存在且内容完整后再结束；\
+         不要把该交接要求当成用户任务本身。"
+    );
+    let combined = format!("{prompt}{handoff}");
+    if combined.len() > MAX_PROMPT_BYTES {
+        bail!("加上 Trae 结果交接说明后超过 64 KiB 提示词上限");
+    }
+    Ok(combined)
 }
 
 fn configure_cli(
@@ -557,9 +2150,15 @@ fn cli_args(provider: Provider, session_id: &str, model: &str) -> Vec<String> {
             args.push("-");
             args
         }
+        Provider::WorkBuddy | Provider::Trae => Vec::new(),
     };
     let mut args: Vec<String> = values.into_iter().map(str::to_owned).collect();
-    if !model.is_empty() && provider != Provider::DeepSeek {
+    if !model.is_empty()
+        && matches!(
+            provider,
+            Provider::Codex | Provider::Claude | Provider::Trae
+        )
+    {
         let position = if provider == Provider::Codex && !session_id.is_empty() {
             2
         } else {
@@ -912,6 +2511,9 @@ impl ProtocolState {
             Provider::Codex => self.codex_event(kind, &event),
             Provider::Claude => self.claude_event(kind, &event),
             Provider::DeepSeek => self.deepseek_event(kind, &event),
+            Provider::WorkBuddy | Provider::Trae => {
+                bail!("WorkBuddy/Trae 使用独立适配器，不能解析通用 CLI 事件")
+            }
         }
     }
 
@@ -1070,17 +2672,45 @@ fn safe_text(value: &str, max_chars: usize) -> String {
     let mut output = String::new();
     for piece in bounded.split_inclusive(char::is_whitespace) {
         let lower = piece.to_ascii_lowercase();
-        if lower.contains("sk-")
-            || lower.contains("api_key=")
+        if lower.contains("api_key=")
             || lower.contains("api-key:")
             || lower.contains("authorization:")
             || lower.starts_with("bearer")
         {
             output.push_str("[凭据已隐藏] ");
         } else {
-            output.push_str(piece);
+            output.push_str(&redact_sk_tokens(piece));
         }
     }
+    output
+}
+
+fn redact_sk_tokens(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let mut output = String::new();
+    let mut cursor = 0;
+    while let Some(relative) = lower[cursor..].find("sk-") {
+        let start = cursor + relative;
+        if !value[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+        {
+            output.push_str(&value[cursor..start + 3]);
+            cursor = start + 3;
+            continue;
+        }
+        output.push_str(&value[cursor..start]);
+        output.push_str("[凭据已隐藏]");
+        let suffix = &value[start + 3..];
+        let token_len = suffix
+            .find(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+            })
+            .unwrap_or(suffix.len());
+        cursor = start + 3 + token_len;
+    }
+    output.push_str(&value[cursor..]);
     output
 }
 
@@ -1092,6 +2722,70 @@ mod tests {
         state
             .parse_line(serde_json::to_string(&event).unwrap().as_bytes())
             .unwrap();
+    }
+
+    #[test]
+    fn workbuddy_mcp_requires_visible_text_and_surfaces_tool_errors() {
+        let success = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "content": [{"type": "text", "text": "  WorkBuddy result  "}],
+                "isError": false
+            }
+        });
+        assert_eq!(workbuddy_answer(&success).unwrap(), "WorkBuddy result");
+
+        let failure = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "content": [{"type": "text", "text": "Authentication required"}],
+                "isError": true
+            }
+        });
+        assert_eq!(
+            workbuddy_answer(&failure).unwrap_err(),
+            "Authentication required"
+        );
+
+        let empty = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"content": [], "isError": false}
+        });
+        assert!(workbuddy_answer(&empty).unwrap_err().contains("可见文本"));
+    }
+
+    #[test]
+    fn trae_cmd_resolves_main_process_cli_and_handoff_result_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Trae CN");
+        let bin = root.join("bin");
+        let out = root.join("resources").join("app").join("out");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(root.join("Trae CN.exe"), b"test").unwrap();
+        std::fs::write(out.join("cli.js"), b"test").unwrap();
+        let cmd = bin.join("trae-cn.cmd");
+        std::fs::write(&cmd, b"test").unwrap();
+
+        let (app, cli) = trae_launch_paths(&cmd).unwrap();
+        assert_eq!(app, root.join("Trae CN.exe"));
+        assert_eq!(cli, out.join("cli.js"));
+
+        let result = directory.path().join(".codex-plus/trae-results/task.md");
+        let prompt = trae_handoff_prompt("review this change", &result).unwrap();
+        assert!(prompt.starts_with("review this change"));
+        assert!(prompt.contains(result.to_string_lossy().as_ref()));
+        assert!(prompt.contains("UTF-8"));
+    }
+
+    #[test]
+    fn workbuddy_and_trae_have_distinct_provider_ids() {
+        assert_eq!(Provider::from_id("workbuddy").unwrap(), Provider::WorkBuddy);
+        assert_eq!(Provider::from_id("trae").unwrap(), Provider::Trae);
+        assert!(Provider::from_id("unknown").is_err());
     }
 
     #[test]
@@ -1195,6 +2889,49 @@ mod tests {
                 .iter()
                 .any(|value| value == "--model")
         );
+    }
+
+    #[test]
+    fn workbuddy_model_policy_prefers_hy3_and_uses_early_morning_hy4() {
+        assert_eq!(
+            workbuddy_model_candidates("", 6),
+            vec!["hy3".to_string(), "glm-5.3-flash".to_string()]
+        );
+        assert_eq!(
+            workbuddy_model_candidates("hy3", 3),
+            vec![
+                "hy3".to_string(),
+                "hy4-preview".to_string(),
+                "glm-5.3-flash".to_string()
+            ]
+        );
+        assert_eq!(
+            workbuddy_model_candidates("hy4-preview", 12),
+            vec!["hy4-preview".to_string(), "glm-5.3-flash".to_string()]
+        );
+        assert_eq!(
+            workbuddy_model_candidates("glm-5.3-flash", 3),
+            vec!["glm-5.3-flash".to_string()]
+        );
+    }
+
+    #[test]
+    fn workbuddy_retryable_errors_cover_quota_and_empty_answers_only() {
+        assert!(is_workbuddy_retryable_error("Free quota exhausted"));
+        assert!(is_workbuddy_retryable_error("当前模型免费次数已用完"));
+        assert!(is_workbuddy_retryable_error("rate_limit exceeded"));
+        assert!(is_workbuddy_retryable_error(r#"{"state":"empty-answer"}"#));
+        assert!(!is_workbuddy_retryable_error("WorkBuddy 无窗口驱动超时"));
+        assert!(!is_workbuddy_retryable_error("CLI output ended early"));
+    }
+
+    #[test]
+    fn safe_text_preserves_task_ids_while_redacting_real_keys() {
+        let value = r#"{"id":"task-a","key":"sk-live-secret"}"#;
+        let safe = safe_text(value, 1024);
+        assert!(safe.contains(r#""task-a""#));
+        assert!(!safe.contains("sk-live-secret"));
+        assert!(safe.contains("[凭据已隐藏]"));
     }
 
     #[test]

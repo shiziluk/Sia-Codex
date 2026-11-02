@@ -7,6 +7,12 @@
   以 Codex 为核心，同时管理 Claude Code、Claude Desktop 与 Grok，还能把 Computer Use 共享给各个 Agent。
 </p>
 
+> [!IMPORTANT]
+> **Sia-Codex** 是本仓库维护的 CodexPlusPlus 非官方 AGPL 下游版本，不是
+> BigPizzaV3 或 OpenAI 的官方发布。它基于 CodexPlusPlus `v2.1.4`（基线提交
+> `59bdcf1c020fa8f561e9607ee99d0e85d73b52e8`），并按 AGPL-3.0-only 分发。
+> 来源、修改范围与商标边界见 [FORK-NOTICE.md](FORK-NOTICE.md)。
+
 <p align="center">
   <a href="https://github.com/BigPizzaV3/CodexPlusPlus/releases"><img src="https://img.shields.io/github/v/release/BigPizzaV3/CodexPlusPlus?style=flat-square&amp;color=7387ff&amp;label=release" alt="最新版本"></a>
   <a href="https://github.com/BigPizzaV3/CodexPlusPlus/stargazers"><img src="https://img.shields.io/github/stars/BigPizzaV3/CodexPlusPlus?style=flat-square&amp;color=e8b86d" alt="GitHub Stars"></a>
