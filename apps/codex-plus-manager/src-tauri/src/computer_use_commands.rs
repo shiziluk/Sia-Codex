@@ -267,14 +267,50 @@ pub async fn computer_use_browser_extension_status() -> CommandResult<Value> {
         "hehggadaopoacecdllhhajmbjkdcmajg",
         "odlomjlbamekndcpllcnffbgeohgkmjh",
     ];
-    // native messaging host 文件：有它说明 Codex 已经注册过了。
-    let host_json = home
-        .join("Library/Application Support/Google/Chrome/NativeMessagingHosts")
-        .join("com.openai.codexextension.json");
-    let host_registered = host_json.is_file();
-    // Chrome 扩展目录：有任意一个 ID 目录就视为已安装。
-    let ext_base = home.join("Library/Application Support/Google/Chrome/Default/Extensions");
-    let ext_installed = EXT_IDS.iter().any(|id| ext_base.join(id).is_dir());
+    #[cfg(target_os = "windows")]
+    let (host_registered, ext_installed) = {
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Local"));
+        let roots = [
+            local.join("Google/Chrome/User Data"),
+            local.join("Microsoft/Edge/User Data"),
+        ];
+        let mut installed = false;
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let extensions = entry.path().join("Extensions");
+                if EXT_IDS.iter().any(|id| extensions.join(id).is_dir()) {
+                    installed = true;
+                    break;
+                }
+            }
+            if installed {
+                break;
+            }
+        }
+        (false, installed)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let (host_registered, ext_installed) = {
+        // native messaging host 文件：有它说明 Codex 已经注册过了。
+        let host_json = home
+            .join("Library/Application Support/Google/Chrome/NativeMessagingHosts")
+            .join("com.openai.codexextension.json");
+        // Chrome 扩展目录：有任意一个 ID 目录就视为已安装。
+        let ext_base =
+            home.join("Library/Application Support/Google/Chrome/Default/Extensions");
+        (
+            host_json.is_file(),
+            EXT_IDS.iter().any(|id| ext_base.join(id).is_dir()),
+        )
+    };
     let installed = host_registered || ext_installed;
     ok(
         if installed {
@@ -328,7 +364,8 @@ pub async fn computer_use_approval_get() -> CommandResult<Value> {
             "pip": codex_plus_core::settings::SettingsStore::default()
                 .load()
                 .map(|settings| settings.computer_use_pip)
-                .unwrap_or(true),
+                .unwrap_or(true)
+                && codex_plus_core::computer_use::pip_supported(),
             "approvals": codex_plus_core::computer_use_approval::ApprovalStore::read_all(),
             "lastClient": codex_plus_core::computer_use_approval::last_client(),
             // 浏览器标签的清理靠 Claude Code 的 Stop 钩子；装上没有要在页面上说清楚。
@@ -370,6 +407,9 @@ pub async fn computer_use_mode_set(mode: String) -> CommandResult<Value> {
     if !matches!(mode.as_str(), "tools" | "js") {
         return failed("操作方式只能是 tools 或 js", json!({}));
     }
+    if mode == "tools" && !codex_plus_core::computer_use::tools_mode_supported() {
+        return failed("Windows 的 Computer Use 目前只支持 JS 操作方式", json!({}));
+    }
     match run_blocking(move || -> anyhow::Result<()> {
         let store = codex_plus_core::settings::SettingsStore::default();
         let mut settings = store.load()?;
@@ -387,6 +427,9 @@ pub async fn computer_use_mode_set(mode: String) -> CommandResult<Value> {
 /// 开关「操作时显示悬浮预览」。写进 `settings.json` 的 `computerUsePip`，只改这一个键。
 #[tauri::command]
 pub async fn computer_use_pip_set(enabled: bool) -> CommandResult<Value> {
+    if enabled && !codex_plus_core::computer_use::pip_supported() {
+        return failed("当前平台的 Computer Use 悬浮预览暂不可用", json!({}));
+    }
     match run_blocking(move || -> anyhow::Result<()> {
         let store = codex_plus_core::settings::SettingsStore::default();
         let mut settings = store.load()?;

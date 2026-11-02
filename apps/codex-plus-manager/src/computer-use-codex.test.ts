@@ -17,10 +17,12 @@ test("Codex 里有残留条目时提示并只提供移除", () => {
   assert.ok(!page.includes("mutateTarget(\"codex\", \"install\")"));
 });
 
-test("非 macOS 平台显示「暂不支持」，不去探测运行时（#2718）", () => {
-  assert.match(page, /const computerUseSupported = enhancementPlatformFromUserAgent\(navigator\.userAgent\) === "macos";/);
-  assert.match(page, /return computerUseSupported \? <ComputerUseMacPage \/> : <ComputerUseUnsupported \/>;/);
-  const unsupported = page.slice(page.indexOf("function ComputerUseUnsupported"), page.indexOf("function ComputerUseMacPage"));
-  assert.ok(unsupported.includes("Computer Use 暂不支持 Windows"));
+test("macOS 与 Windows 使用原生 Computer Use 页面，其它平台不探测运行时", () => {
+  assert.match(page, /computerUsePlatform === "macos" \|\| computerUsePlatform === "windows"/);
+  assert.match(page, /return computerUseSupported \? <ComputerUseNativePage \/> : <ComputerUseUnsupported \/>;/);
+  const unsupported = page.slice(page.indexOf("function ComputerUseUnsupported"), page.indexOf("function ComputerUseNativePage"));
+  assert.ok(unsupported.includes("当前平台暂不支持 Computer Use"));
   assert.ok(!unsupported.includes("invoke("), "不支持的平台不应调用后端探测");
+  assert.ok(page.includes("disabled={locked || computerUseIsWindows}"));
+  assert.ok(page.includes("{!computerUseIsWindows ? <label className=\"cu-setting\">"));
 });

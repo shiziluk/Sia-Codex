@@ -79,6 +79,9 @@ impl CuMode {
 
     /// 从设置文件现读。读失败按默认处理。
     pub fn current() -> Self {
+        if !crate::computer_use::tools_mode_supported() {
+            return Self::Js;
+        }
         let value = crate::settings::SettingsStore::default()
             .load()
             .map(|settings| settings.computer_use_mode)
@@ -180,9 +183,11 @@ enum Frame {
 
 /// 以 stdio MCP server 的身份运行，直到客户端断开。
 pub fn serve() -> anyhow::Result<()> {
-    let runtime =
-        locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），Computer Use 不可用")?;
+    let runtime = locate_runtime()?.context("未找到 Codex Computer Use 运行时")?;
     let cu_mode = CuMode::current();
+    if matches!(cu_mode, CuMode::Tools) && !crate::computer_use::tools_mode_supported() {
+        anyhow::bail!("Windows 的 Computer Use 目前只支持 JS 操作方式");
+    }
     let mut child = match cu_mode {
         CuMode::Tools => spawn_child(&runtime, &crate::computer_use::ensure_shim()?)?,
         CuMode::Js => spawn_js_child(&runtime)?,

@@ -125,8 +125,8 @@ function stateLabel(state: CuTargetState): string {
 }
 function failureText(check: CuCheck): string {
   switch (check.failureKind) {
-    case "unsupported_platform": return t("Computer Use 暂不支持 Windows");
-    case "runtime_missing": return t("没找到 ChatGPT.app，请先安装 Codex 桌面版");
+    case "unsupported_platform": return t("当前平台暂不支持 Computer Use");
+    case "runtime_missing": return t("没找到 Codex Computer Use 运行时，请先在 Codex 中打开一次 Computer Use");
     case "untrusted_parent": return t("Computer Use 拒绝了本次调用：ChatGPT.app 版本不兼容，请更新后再试");
     case "permission_required": return t("请在系统设置里给 ChatGPT 授予辅助功能/屏幕录制权限");
     case "client_unsupported": return t("当前客户端不支持审批卡（elicitation）");
@@ -136,14 +136,15 @@ function failureText(check: CuCheck): string {
   }
 }
 
-/** Computer Use 依赖 macOS 版 ChatGPT.app 自带的运行时，其它平台暂无可接入的运行时（#2718）。 */
-const computerUseSupported = enhancementPlatformFromUserAgent(navigator.userAgent) === "macos";
+const computerUsePlatform = enhancementPlatformFromUserAgent(navigator.userAgent);
+const computerUseSupported = computerUsePlatform === "macos" || computerUsePlatform === "windows";
+const computerUseIsWindows = computerUsePlatform === "windows";
 
 export function ComputerUsePage() {
-  return computerUseSupported ? <ComputerUseMacPage /> : <ComputerUseUnsupported />;
+  return computerUseSupported ? <ComputerUseNativePage /> : <ComputerUseUnsupported />;
 }
 
-/** 非 macOS 平台只给出明确的「暂不支持」说明，不去探测运行时，避免误报「找不到 ChatGPT」。 */
+/** 其它平台只给出明确的「暂不支持」说明，不去探测运行时。 */
 function ComputerUseUnsupported() {
   return <div className="mg-page cu-page">
     <PageHeader icon={<MonitorSmartphone size={20} strokeWidth={1.5} />} title="Computer Use" />
@@ -151,15 +152,15 @@ function ComputerUseUnsupported() {
       <div className="cu-runtime-missing" role="status" data-reason="unsupported-platform">
         <AlertTriangle size={16} />
         <div>
-          <strong>{t("Computer Use 暂不支持 Windows")}</strong>
-          <p>{t("Computer Use 接入目前只支持 macOS：它依赖 macOS 版 ChatGPT.app 自带的 Computer Use 服务，当前平台还没有可接入的运行时。")}</p>
+          <strong>{t("当前平台暂不支持 Computer Use")}</strong>
+          <p>{t("Computer Use 接入目前支持 macOS 与 Windows。")}</p>
         </div>
       </div>
     </div>
   </div>;
 }
 
-function ComputerUseMacPage() {
+function ComputerUseNativePage() {
   const [status, setStatus] = useState<CuStatus | null>(null);
   const [check, setCheck] = useState<CuCheck | null>(null);
   const [backups, setBackups] = useState<Record<string, string>>({});
@@ -354,8 +355,8 @@ function ComputerUseMacPage() {
     try {
       const result = await invoke<CuResult>("computer_use_open_app");
       if (!mounted.current || epoch.current !== stamp) return;
-      if (result.status === "ok") setNotice(t("已请求打开 ChatGPT.app。"));
-      else setActionError(result.message || t("打开 ChatGPT.app 失败。"));
+      if (result.status === "ok") setNotice(t("已请求打开 Codex。"));
+      else setActionError(result.message || t("打开 Codex 失败。"));
     } catch (reason) {
       if (mounted.current && epoch.current === stamp) setActionError(errorText(reason));
     } finally {
@@ -605,7 +606,7 @@ function ComputerUseMacPage() {
   /**
    * 工作原理图，布局与网关总览一致：左列 AI 客户端 → 中间 Codex++ MCP 服务 → 右列被操作的对象，
    * 用同一个 HubTopology 按节点真实位置画曲线。已接入的客户端实线连到中间，未接入的虚线；
-   * 运行时（ChatGPT.app、Chrome 扩展）缺失时右侧连线变成告警色。
+   * 运行时（Codex Computer Use、Chrome 扩展）缺失时右侧连线变成告警色。
    */
   const renderFlow = () => {
     const clients: Array<{ id: string; label: string; target: CuTarget | undefined; custom?: CuCustomTarget }> = [
@@ -625,7 +626,7 @@ function ComputerUseMacPage() {
       <div className="cu-card-head">
         <div>
           <h2 id="cu-flow-title">{t("工作原理")}</h2>
-          <p>{t("Codex++ 把 ChatGPT.app 里现成的 Computer Use 与 Chrome 扩展，通过 MCP 转给其它 AI 客户端。左边点「接入」；操作方式、审批与悬浮预览在图下方设置。")}</p>
+          <p>{t("Codex++ 把 Codex 桌面版现成的 Computer Use 与 Chrome 扩展，通过 MCP 转给其它 AI 客户端。左边点「接入」；操作方式与审批在图下方设置。")}</p>
         </div>
       </div>
       <HubTopology links={links}>
@@ -652,7 +653,7 @@ function ComputerUseMacPage() {
         <div className="hub-col">
           <div className="hub-col-head"><span>{t("被操作的对象")}</span><span /></div>
           {flowTarget("cu-target:desktop", <AppWindow size={16} />, t("本机桌面应用"),
-            !status ? t("检测中…") : found ? t("经 ChatGPT.app 原生 Computer Use") : t("未找到 ChatGPT.app，先安装 Codex 桌面版"),
+            !status ? t("检测中…") : found ? t("经 Codex 桌面版原生 Computer Use") : t("未找到 Codex Computer Use 运行时"),
             Boolean(status) && !found)}
           {flowTarget("cu-target:chrome", <Globe size={16} />, t("Chrome 标签页"),
             extStatus == null ? t("检测中…") : chromeReady ? t("经 ChatGPT for Chrome 扩展，用你已登录的浏览器") : t("未安装 ChatGPT for Chrome 扩展"),
@@ -675,8 +676,8 @@ function ComputerUseMacPage() {
         <div className="mg-segmented" role="radiogroup" aria-label={t("操作方式")}>
           <button type="button" role="radio" aria-checked={cuMode === "js"} data-active={cuMode === "js"} disabled={locked}
             title={t("和 Codex 一样，用 cua_repl 的 js 工具操作桌面与 Chrome；首次使用会自动下发完整说明与确认规则，支持 paste 输入中文。")} onClick={() => void changeCuMode("js")}>{t("JS（同 Codex）")}<span className="cu-flow-recommend">{t("推荐")}</span></button>
-          <button type="button" role="radio" aria-checked={cuMode === "tools"} data-active={cuMode === "tools"} disabled={locked}
-            title={t("原生 Computer Use 的 10 个离散工具：get_app_state、click、type_text 等。")} onClick={() => void changeCuMode("tools")}>{t("离散工具")}</button>
+          <button type="button" role="radio" aria-checked={cuMode === "tools"} data-active={cuMode === "tools"} disabled={locked || computerUseIsWindows}
+            title={computerUseIsWindows ? t("Windows 目前只支持 JS 操作方式") : t("原生 Computer Use 的 10 个离散工具：get_app_state、click、type_text 等。")} onClick={() => void changeCuMode("tools")}>{t("离散工具")}</button>
         </div>
       </div>
       <div className="cu-setting">
@@ -694,13 +695,13 @@ function ComputerUseMacPage() {
             title={t("和 Codex 一样，把许可请求转给当前连接的客户端弹卡确认；拒绝即不放行。")} onClick={() => void changeApprovalMode("claude")}>{t("弹卡确认")}</button>
         </div>
       </div>
-      <label className="cu-setting">
+      {!computerUseIsWindows ? <label className="cu-setting">
         <span className="cu-setting-copy">
           <strong>{t("操作后台应用时显示悬浮预览")}</strong>
           <small>{t("同 Codex 的画中画：在屏幕右上角实时显示目标窗口；回合结束或空闲 20 秒自动收起。需要屏幕录制权限。")}</small>
         </span>
         <input className="cu-setting-check" type="checkbox" checked={approval?.pip ?? true} disabled={locked} onChange={(event) => void changePip(event.target.checked)} />
-      </label>
+      </label> : null}
     </div>
     <p className="cu-flow-foot">{cuMode === "js"
       ? t("接入后重启对应客户端。JS 方式下桌面与浏览器都用 mcp__codex-plus-cu__js，codex-plus-browser 不提供工具。")
@@ -785,12 +786,12 @@ function ComputerUseMacPage() {
       {status && !found && <div className="cu-runtime-missing" role="status">
         <AlertTriangle size={16} />
         <div>
-          <strong>{t("没找到 ChatGPT.app")}</strong>
+          <strong>{t("没找到 Codex Computer Use 运行时")}</strong>
           <p>{status.configHint || t("请先安装 Codex 桌面版，安装后点「重新检测」。")}</p>
         </div>
-        <button className="mg-button" type="button" onClick={() => void openChatGpt()} disabled={locked}>
+        {!computerUseIsWindows ? <button className="mg-button" type="button" onClick={() => void openChatGpt()} disabled={locked}>
           {busy === "open" ? <Loader2 size={14} className="cu-spin" /> : <Play size={14} />}{busy === "open" ? t("正在打开…") : t("打开 ChatGPT")}
-        </button>
+        </button> : null}
       </div>}
 
       {/* 与会话页等其他页面同一种下划线页签（tp-tabs）。 */}
@@ -937,7 +938,7 @@ function ComputerUseMacPage() {
           <div className="cu-card-head">
             <div>
               <h2 id="cu-runtime-title">{t("运行时")}</h2>
-              <p>{t("Computer Use 的服务由本机 ChatGPT.app 提供，接入前先确认它能被找到。")}</p>
+              <p>{t("Computer Use 的服务由本机 Codex 桌面版提供，接入前先确认它能被找到。")}</p>
             </div>
             <span className="cu-badge" data-state={!status ? "unknown" : found ? "ok" : "missing"}>{!status ? t("未检测") : found ? t("已找到") : t("未找到")}</span>
           </div>
