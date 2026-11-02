@@ -31,6 +31,8 @@ const TRAE_HEADLESS_CDP_PORT: u16 = 39222;
 const TRAE_HEADLESS_SCRIPT: &str = include_str!("trae_headless_chat.mjs");
 const WORKBUDDY_HEADLESS_CDP_PORT: u16 = 39223;
 const WORKBUDDY_HEADLESS_SCRIPT: &str = include_str!("workbuddy_headless_chat.mjs");
+const DOUBAO_HEADLESS_CDP_PORT: u16 = 39224;
+const DOUBAO_HEADLESS_SCRIPT: &str = include_str!("doubao_headless_chat.mjs");
 
 struct OwnedTask {
     handle: tokio::task::JoinHandle<()>,
@@ -58,6 +60,7 @@ enum Provider {
     DeepSeek,
     WorkBuddy,
     Trae,
+    Doubao,
 }
 
 impl Provider {
@@ -68,6 +71,7 @@ impl Provider {
             "deepseek" => Ok(Self::DeepSeek),
             "workbuddy" => Ok(Self::WorkBuddy),
             "trae" => Ok(Self::Trae),
+            "doubao" => Ok(Self::Doubao),
             _ => bail!("不支持的协作 Agent：{id}"),
         }
     }
@@ -185,7 +189,7 @@ fn auto_detect_executable(provider: Provider, local_appdata: Option<&Path>) -> O
             Provider::DeepSeek => candidates.push(PathBuf::from(
                 "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
             )),
-            Provider::Claude | Provider::WorkBuddy | Provider::Trae => {}
+            Provider::Claude | Provider::WorkBuddy | Provider::Trae | Provider::Doubao => {}
         }
     }
     if let Some(local_appdata) = local_appdata {
@@ -203,8 +207,23 @@ fn auto_detect_executable(provider: Provider, local_appdata: Option<&Path>) -> O
                     .join("bin")
                     .join("trae-cn.cmd"),
             ),
+            Provider::Doubao => {
+                candidates.push(local_appdata.join("DoubaoWork").join("DoubaoWork.exe"));
+                candidates.push(
+                    local_appdata
+                        .join("Programs")
+                        .join("DoubaoWork")
+                        .join("DoubaoWork.exe"),
+                );
+            }
             Provider::Codex | Provider::Claude | Provider::DeepSeek => {}
         }
+    }
+    if let Some(path) = std::env::var_os("DOUBAO_WORK_EXE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        candidates.insert(0, path);
     }
     let command = match provider {
         Provider::Codex => "codex",
@@ -212,6 +231,7 @@ fn auto_detect_executable(provider: Provider, local_appdata: Option<&Path>) -> O
         Provider::DeepSeek => "dsh",
         Provider::WorkBuddy => "workbuddy",
         Provider::Trae => "trae-cn",
+        Provider::Doubao => "doubao",
     };
     if let Some(home) = directories::BaseDirs::new() {
         candidates.push(home.home_dir().join(".local/bin").join(command));
@@ -524,6 +544,9 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
     if provider == Provider::Trae {
         return run_trae_headless(store, &task, &executable, &cwd, runtime_limit).await;
     }
+    if provider == Provider::Doubao {
+        return run_doubao_headless(store, &task, &executable, &cwd, runtime_limit).await;
+    }
 
     let overlay = if provider == Provider::DeepSeek {
         super::dsh::prepare_overlay(store, &task, agent)?
@@ -772,6 +795,231 @@ async fn run_workbuddy_headless(
         error: String::new(),
         session_id: String::new(),
     })
+}
+
+async fn run_doubao_headless(
+    store: &Store,
+    task: &TaskRecord,
+    executable: &Path,
+    cwd: &Path,
+    runtime_limit: Duration,
+) -> anyhow::Result<Outcome> {
+    let node = resolve_command("node").context("未找到 Node.js，无法启动豆包工作无窗口驱动")?;
+    let runtime_dir = crate::paths::default_app_state_dir()
+        .join("agent-collaboration")
+        .join("doubao-headless");
+    std::fs::create_dir_all(runtime_dir.join("prompts"))?;
+    let script_path = runtime_dir.join("doubao-cdp-chat.mjs");
+    if std::fs::read_to_string(&script_path).ok().as_deref() != Some(DOUBAO_HEADLESS_SCRIPT) {
+        std::fs::write(&script_path, DOUBAO_HEADLESS_SCRIPT)
+            .context("无法写入豆包工作无窗口驱动脚本")?;
+    }
+    let safe_task_id: String = task
+        .id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let prompt_path = runtime_dir
+        .join("prompts")
+        .join(format!("{safe_task_id}.txt"));
+    std::fs::write(&prompt_path, &task.prompt).context("无法写入豆包工作任务提示词")?;
+
+    let port = DOUBAO_HEADLESS_CDP_PORT;
+    let already_running = cdp_port_open(port).await;
+    store.update_progress(
+        &task.id,
+        if already_running {
+            "正在连接无窗口豆包工作"
+        } else {
+            "正在启动无窗口豆包工作"
+        },
+    )?;
+    if !already_running {
+        let mut app = Command::new(executable);
+        app.arg("--headless=new")
+            .arg(format!("--remote-debugging-port={port}"))
+            .arg("--no-first-run")
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        app.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+        app.spawn()
+            .context("无法启动无窗口豆包工作，请检查可执行文件路径")?;
+    }
+    if !wait_for_cdp(port, Duration::from_secs(60)).await {
+        let _ = std::fs::remove_file(&prompt_path);
+        bail!("豆包工作无窗口模式在 60 秒内没有启动本地调试端口");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    store.update_progress(&task.id, "无窗口豆包工作已就绪；正在提交任务")?;
+    let mut command = Command::new(node);
+    command
+        .arg(&script_path)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("DOUBAO_PROMPT_FILE", &prompt_path)
+        .env("DOUBAO_TIMEOUT_MS", runtime_limit.as_millis().to_string())
+        .env("DOUBAO_CDP_PORT", port.to_string())
+        .env("NODE_NO_WARNINGS", "1");
+    #[cfg(windows)]
+    command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&prompt_path);
+            return Err(error).context("无法启动豆包工作无窗口驱动");
+        }
+    };
+    let mut process_group = ProcessGroup::new(&child);
+    let stdout = child
+        .stdout
+        .take()
+        .context("无法读取豆包工作无窗口驱动输出")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("无法读取豆包工作无窗口驱动诊断输出")?;
+    let stdout_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stdout
+            .take(MAX_STDOUT_BYTES as u64)
+            .read_to_end(&mut output)
+            .await
+            .map(|_| output)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stderr
+            .take(MAX_STDERR_BYTES as u64)
+            .read_to_end(&mut output)
+            .await
+            .map(|_| output)
+    });
+
+    let deadline = tokio::time::Instant::now() + runtime_limit;
+    let mut last_touch = Instant::now();
+    let mut stopped = false;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("无法读取豆包工作无窗口驱动状态")? {
+            break Some(status);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            timed_out = true;
+            terminate(&mut child, &mut process_group).await;
+            break None;
+        }
+        if store.worker_should_stop(&task.id)? {
+            stopped = true;
+            terminate(&mut child, &mut process_group).await;
+            break None;
+        }
+        if last_touch.elapsed() >= Duration::from_secs(10) {
+            store.touch(&task.id)?;
+            last_touch = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    if !stopped && !timed_out {
+        process_group.disarm();
+    }
+    let stdout = stdout_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let stderr = stderr_task
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&prompt_path);
+    if stopped {
+        return Ok(stopped_outcome(
+            &task.session_id,
+            "豆包工作无窗口任务已取消；后台 Agent 可能仍会完成当前请求",
+        ));
+    }
+    if timed_out {
+        return Ok(Outcome {
+            status: "handed_off",
+            answer: "豆包工作的无窗口会话仍在后台运行；当前运行时限内未确认最终答复。"
+                .to_string(),
+            error: "豆包工作无窗口驱动超时；该状态不代表任务成功".to_string(),
+            session_id: String::new(),
+        });
+    }
+    if !status.is_some_and(|status| status.success()) {
+        let diagnostic = if stderr.iter().all(u8::is_ascii_whitespace) {
+            &stdout
+        } else {
+            &stderr
+        };
+        return Ok(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: safe_text(
+                &format!(
+                    "豆包工作无窗口执行失败；{}",
+                    String::from_utf8_lossy(diagnostic).trim()
+                ),
+                1600,
+            ),
+            session_id: String::new(),
+        });
+    }
+    let payload: Value =
+        serde_json::from_slice(&stdout).context("无法解析豆包工作无窗口驱动的返回结果")?;
+    let state = payload.get("state").and_then(Value::as_str).unwrap_or_default();
+    let message = payload
+        .get("error")
+        .or_else(|| payload.get("answer"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    match state {
+        "completed" if !message.is_empty() => Ok(Outcome {
+            status: "completed",
+            answer: safe_text(message, MAX_OUTPUT_BYTES),
+            error: String::new(),
+            session_id: String::new(),
+        }),
+        "handed-off" => Ok(Outcome {
+            status: "handed_off",
+            answer: String::new(),
+            error: safe_text(message, 1600),
+            session_id: String::new(),
+        }),
+        _ => Ok(Outcome {
+            status: "failed",
+            answer: String::new(),
+            error: safe_text(
+                if message.is_empty() {
+                    "豆包工作未返回明确完成结果"
+                } else {
+                    message
+                },
+                1600,
+            ),
+            session_id: String::new(),
+        }),
+    }
 }
 
 fn workbuddy_model_candidates(
@@ -2150,7 +2398,7 @@ fn cli_args(provider: Provider, session_id: &str, model: &str) -> Vec<String> {
             args.push("-");
             args
         }
-        Provider::WorkBuddy | Provider::Trae => Vec::new(),
+        Provider::WorkBuddy | Provider::Trae | Provider::Doubao => Vec::new(),
     };
     let mut args: Vec<String> = values.into_iter().map(str::to_owned).collect();
     if !model.is_empty()
@@ -2511,7 +2759,7 @@ impl ProtocolState {
             Provider::Codex => self.codex_event(kind, &event),
             Provider::Claude => self.claude_event(kind, &event),
             Provider::DeepSeek => self.deepseek_event(kind, &event),
-            Provider::WorkBuddy | Provider::Trae => {
+            Provider::WorkBuddy | Provider::Trae | Provider::Doubao => {
                 bail!("WorkBuddy/Trae 使用独立适配器，不能解析通用 CLI 事件")
             }
         }
@@ -2785,6 +3033,7 @@ mod tests {
     fn workbuddy_and_trae_have_distinct_provider_ids() {
         assert_eq!(Provider::from_id("workbuddy").unwrap(), Provider::WorkBuddy);
         assert_eq!(Provider::from_id("trae").unwrap(), Provider::Trae);
+        assert_eq!(Provider::from_id("doubao").unwrap(), Provider::Doubao);
         assert!(Provider::from_id("unknown").is_err());
     }
 

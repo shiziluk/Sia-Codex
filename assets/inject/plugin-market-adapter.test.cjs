@@ -15,7 +15,7 @@ const clientPatch = native.slice(native.indexOf("  function patchPluginMarketpla
 const transportPatch = native.slice(native.indexOf("  function installPluginMarketplaceBridgePatch("), native.indexOf("  const pluginMarketplaceRequestPatchMaxMisses"));
 const prototypePatch = model.slice(model.indexOf("    function installCodexAppServerClientPrototypePatch("), model.indexOf("  const appServerModelRequestPatchMaxMisses"));
 // 原型补丁里经旁支保存（#2660）包装原生请求；辅助函数定义在截取范围外，需要一并带上。
-const sideChatSend = model.slice(model.indexOf("  function sendAppServerRequestWithSideChat("), model.indexOf("  // issue #2177："));
+const sideChatSend = model.slice(model.indexOf("  async function sendAppServerRequestThroughExchange("), model.indexOf("  // issue #2177："));
 const flush = async () => { await new Promise((resolve) => setImmediate(resolve)); await new Promise((resolve) => setImmediate(resolve)); };
 const sentinel = (source = "public") => `/fixture/.tmp/codex-plus-plugin-market/virtual-${source}/.agents/plugins/marketplace.json`;
 const managedSummary = { name: "sample", id: "sample@codex-plus-plugin-market-123456789abc", codexPlusIndexId: "original-id", installed: false };
@@ -64,6 +64,8 @@ function fixture(handler, { enabled = true } = {}) {
     codexPlusSettings: () => ({ serviceTierControls: false }),
     codexRemoteSessionProviderRequestMethod: () => false, codexRemoteSessionProviderOverrideEnabled: () => false,
     applyCodexRemoteSessionProviderOverride: (_, params) => params, applyCodexServiceTierRequestOnly: (_, params) => params,
+    // 拓展的 codex/request 中间件：这里没有拓展，原样放行。
+    codexPlusApplyExtensionRequestMiddlewareAsync: async (_, params) => params, codexPlusExtensionWantsRequestMiddleware: () => false,
     refreshCodexThreadModelBeforeTurn: async () => null,
     codexThreadModelRequestState: () => ({ threadId: "", model: "" }),
     NativeClient,
@@ -398,4 +400,28 @@ test("plugin/search 走 MCP 消息传输时也合并索引结果", async () => {
   await flush();
   const reply = f.delivered.find((event) => event.data?.message?.id === "plugin/search:1").data;
   assert.deepEqual(pluginNames(reply.message.result), ["gmail", "mail-tool"]);
+});
+
+test("装完插件刷新原生插件列表：新版 Codex 没有全局 queryClient 时从 React 树找到并按 plugins 前缀失效", () => {
+  const conversation = readFileSync(`${root}/95-conversation-view.js`, "utf8");
+  const clear = native.slice(native.indexOf("  function clearPluginMarketplaceQueryCache("), native.indexOf("  function installPluginMarketplaceBridgePatch("));
+  const finder = conversation.slice(conversation.indexOf("  function looksLikeQueryClient("), conversation.indexOf("  function mainRateLimitQueries("));
+  const invalidated = [], diagnostics = [];
+  const client = { getQueryCache() { return {}; }, setQueryData() {}, invalidateQueries(filters) { invalidated.push(filters.queryKey); return Promise.resolve(); } };
+  // React 根容器 → QueryClientProvider（props.client），没有 window.__REACT_QUERY_CLIENT__。
+  const rootNode = { "__reactContainer$x": { stateNode: { current: { child: { memoizedProps: {}, sibling: { memoizedProps: { client } } } } } } };
+  const run = (documentRoot) => {
+    const context = {
+      window: {}, document: { getElementById: () => documentRoot, body: null, documentElement: null },
+      clearPluginMarketplaceRemoteCatalogUnavailable() {},
+      sendCodexPlusDiagnostic(event) { diagnostics.push(event); },
+    };
+    vm.runInNewContext(`${finder}\n${clear}\nclearPluginMarketplaceQueryCache(); clearPluginMarketplaceQueryCache();`, context);
+  };
+  run(rootNode);
+  assert.deepEqual(JSON.parse(JSON.stringify(invalidated)), [["plugins"], ["plugins"]]);
+  assert.deepEqual(diagnostics, []);
+  // 找不到时只报一次诊断，不抛错。
+  run(null);
+  assert.deepEqual(diagnostics, ["plugin_marketplace_query_client_missing"]);
 });

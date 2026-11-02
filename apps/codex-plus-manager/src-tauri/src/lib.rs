@@ -1,11 +1,15 @@
 mod agent_collaboration_commands;
+mod extension_creator_commands;
 mod agent_launch_commands;
 mod agent_mcp_commands;
-mod agent_pet_commands;
 mod auto_takeover;
 pub mod commands;
 mod computer_use_commands;
 mod cu_pip;
+mod dsh_plugin_commands;
+mod extension_community_commands;
+mod extension_curation_commands;
+mod extension_publish_commands;
 mod gateway_commands;
 mod global_dictation;
 pub mod install;
@@ -61,6 +65,30 @@ fn record_shutdown_entry(event: &'static str, detail: serde_json::Value) {
 
 pub fn run_agent_collaboration_mcp(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
     agent_collaboration_commands::run_mcp(args)
+}
+
+/// Codex 钩子分发：`--codex-plus-hook <事件>`，由 Codex 在对应时机经 shell 调用。
+pub fn run_extension_hook(event: &str) -> i32 {
+    let manager = commands::default_user_script_manager();
+    // 钩子进程不托管后台：服务调用经 Codex 页面桥接转发（钩子不继承管理器环境，按默认状态目录找端口）。
+    codex_plus_core::extension_backend::set_remote_bridge_ports(extension_creator_commands::debug_ports(
+        &codex_plus_core::paths::default_app_state_dir(),
+    ));
+    tauri::async_runtime::block_on(codex_plus_core::extension_hooks::run_cli(&manager, event))
+}
+
+/// 宿主调用：`--codex-plus-host-call`，dsh 插件宿主等 Node 进程经它读写会话、调模型、问用户。
+pub fn run_extension_host_call() -> i32 {
+    let manager = commands::default_user_script_manager();
+    codex_plus_core::extension_backend::set_remote_bridge_ports(extension_creator_commands::debug_ports(
+        &codex_plus_core::paths::default_app_state_dir(),
+    ));
+    tauri::async_runtime::block_on(codex_plus_core::extension_backend::run_host_call_cli(&manager))
+}
+
+/// 「对话造拓展」MCP：由 Codex 以 `--codex-plus-extension-mcp` 拉起的 stdio 进程。
+pub fn run_extension_creator_mcp(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
+    extension_creator_commands::run_mcp(args)
 }
 
 /// 卸载清理：把走网关的 Agent 恢复成直连（见 [`gateway_commands::restore_for_uninstall`]）。
@@ -247,6 +275,11 @@ pub fn run() {
             build_main_window(app.handle(), url, !start_minimized)?;
             install_tray(app)?;
             gateway_commands::set_app_handle(app.handle().clone());
+            // Codex 钩子的分发条目里写的是程序绝对路径：程序换了位置（更新、换安装目录）后
+            // 旧条目会指向不存在的路径，启动时按当前程序与拓展同步一次。没有拓展钩子时只读不写。
+            tauri::async_runtime::spawn_blocking(|| {
+                codex_plus_core::extension_hooks::sync_default(&commands::default_user_script_manager());
+            });
             codex_plus_core::settings::set_external_settings_change_listener(
                 gateway_commands::notify_settings_changed,
             );
@@ -286,6 +319,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             agent_collaboration_commands::agent_collaboration_request,
+            dsh_plugin_commands::dsh_plugins_request,
+            extension_community_commands::extension_community_request,
+            extension_publish_commands::extension_publish_request,
+            extension_curation_commands::extension_curation_request,
+            extension_creator_commands::extension_creator_request,
             agent_collaboration_commands::agent_collaboration_events,
             agent_collaboration_commands::agent_collaboration_conflict_preview,
             agent_collaboration_commands::agent_collaboration_event_stream,
@@ -303,6 +341,7 @@ pub fn run() {
             commands::stop_codex_plus,
             commands::load_settings,
             commands::load_request_logs,
+            commands::load_request_flow,
             commands::clear_request_logs,
             commands::dictation_local_model_status,
             commands::download_dictation_local_model,
@@ -344,20 +383,18 @@ pub fn run() {
             commands::test_vlm,
             provider_lookup_commands::fetch_provider_models,
             provider_lookup_commands::lookup_model_prices,
-            agent_pet_commands::agent_pet_catalog,
-            agent_pet_commands::agent_pet_image,
-            agent_pet_commands::agent_pet_sounds,
-            agent_pet_commands::agent_pet_sound_catalog,
-            agent_pet_commands::agent_pet_sound,
-            agent_pet_commands::agent_pet_import_sound,
             agent_launch_commands::open_agent_terminal,
             agent_mcp_commands::load_agent_mcp,
             agent_mcp_commands::save_agent_mcp,
             gateway_commands::load_gateway,
             gateway_commands::save_gateway_binding,
             gateway_commands::disable_gateway_binding,
+            gateway_commands::use_gateway_own_model,
+            gateway_commands::save_gateway_own_models_shown,
             gateway_commands::rotate_gateway_token,
             gateway_commands::save_gateway_model_suffix,
+            gateway_commands::save_gateway_local_login_discovery,
+            gateway_commands::scan_gateway_local_logins,
             gateway_commands::save_gateway_auto_group,
             gateway_commands::save_gateway_auto_models,
             gateway_commands::save_gateway_favorites,
@@ -374,6 +411,9 @@ pub fn run() {
             gateway_commands::check_gateway_provider_models,
             gateway_commands::preview_gateway_provider_models_sync,
             gateway_commands::apply_gateway_provider_models_sync,
+            gateway_commands::preview_gateway_provider_meta_sync,
+            gateway_commands::apply_gateway_provider_windows_sync,
+            gateway_commands::apply_gateway_provider_reasoning_sync,
             gateway_commands::save_gateway_provider_models,
             gateway_commands::refresh_gateway_quota,
             gateway_commands::sync_gateway_provider_prices,
@@ -393,6 +433,8 @@ pub fn run() {
             gateway_commands::start_gateway_copilot_login,
             gateway_commands::finish_gateway_copilot_login,
             gateway_commands::login_gateway_grok,
+            gateway_commands::start_gateway_subscription_login,
+            gateway_commands::finish_gateway_subscription_login,
             gateway_commands::login_gateway_chatgpt_api,
             gateway_commands::cancel_gateway_login,
             gateway_commands::import_gateway_providers,
@@ -414,6 +456,9 @@ pub fn run() {
             lightweight::main_window_release_when_hidden,
             commands::weixin_connect_qr_start,
             commands::weixin_connect_qr_status,
+            commands::weixin_connect_catalog,
+            commands::weixin_connect_projects,
+            commands::weixin_connect_reset_session,
             commands::weixin_connect_status,
             commands::weixin_connect_start,
             commands::weixin_connect_stop,
@@ -472,6 +517,13 @@ pub fn run() {
             commands::set_user_scripts_enabled,
             commands::set_user_scripts_skip_next_start,
             commands::set_user_script_enabled,
+            commands::set_extension_config,
+            commands::update_extension_config_live,
+            commands::extension_manager_page,
+            commands::extension_manager_asset,
+            commands::extension_page_call,
+            commands::extension_manager_backend_call,
+            commands::extension_manager_data,
             commands::delete_user_script,
             commands::refresh_skill_catalog,
             commands::list_installed_skills,
@@ -516,7 +568,6 @@ pub fn run() {
             commands::set_settings_path,
             commands::reset_settings_path,
             commands::reset_settings,
-            commands::reset_image_overlay_settings,
             commands::relay_status,
             commands::read_relay_files,
             commands::check_env_conflicts,

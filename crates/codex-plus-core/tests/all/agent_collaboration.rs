@@ -91,7 +91,7 @@ fn legacy_configuration_gets_a_default_without_enabling_workers_or_changing_mode
     assert!(store.save_config(invalid).is_err());
     let saved = store.config().unwrap();
     assert_eq!(saved.enabled, config.enabled);
-    assert_eq!(saved.agents.len(), 5);
+    assert_eq!(saved.agents.len(), 6);
     for legacy in &config.agents {
         assert_eq!(
             saved
@@ -102,7 +102,7 @@ fn legacy_configuration_gets_a_default_without_enabling_workers_or_changing_mode
             legacy
         );
     }
-    for id in ["workbuddy", "trae"] {
+    for id in ["workbuddy", "trae", "doubao"] {
         let added = saved.agents.iter().find(|agent| agent.id == id).unwrap();
         assert!(!added.enabled);
         assert!(added.executable.is_empty());
@@ -146,8 +146,8 @@ fn legacy_snapshot_exposes_new_adapters_before_the_next_save() {
 
     let snapshot = store.snapshot().unwrap();
     let agents = snapshot["config"]["agents"].as_array().unwrap();
-    assert_eq!(agents.len(), 5);
-    for id in ["workbuddy", "trae"] {
+    assert_eq!(agents.len(), 6);
+    for id in ["workbuddy", "trae", "doubao"] {
         let agent = agents.iter().find(|agent| agent["id"] == id).unwrap();
         assert_eq!(agent["enabled"], false);
         assert_eq!(agent["executable"], "");
@@ -509,7 +509,8 @@ fn mcp_protocol_keeps_errors_per_request_and_never_exposes_configuration_mutatio
             "sansheng_accept",
             "sansheng_cancel",
             "sansheng_resolve_conflict",
-            "sansheng_retry_merge"
+            "sansheng_retry_merge",
+            "delegate_to_doubao"
         ]
     );
     let rejected = mcp::handle_request(&store, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send_task","arguments":request(&temp,"codex")}})).unwrap();

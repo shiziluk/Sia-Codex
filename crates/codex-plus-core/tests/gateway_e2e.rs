@@ -1,4 +1,4 @@
-//! 网关模式端到端：真实 helper + 模拟上游，覆盖 Claude Code / Grok 经网关的完整链路。
+//! 网关模式端到端：真实 helper + 模拟上游，覆盖 Claude Code / Grok / 通用 Agent（Chat、Gemini 入站）经网关的完整链路。
 //!
 //! 常驻 helper 是进程级单例、状态目录靠进程级环境变量覆盖，所以全部场景放在一个测试里顺序执行。
 
@@ -149,6 +149,7 @@ fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
             newapi_access: None,
+            upstream_meta: Default::default(),
             relay,
             extra: Default::default(),
         })
@@ -396,6 +397,37 @@ async fn gateway_end_to_end() {
         assert_eq!(body["store"], false);
     }
 
+    // —— 3b. Claude 系请求的档位套到上游模型实有的档位 ——
+    let fit_body = json!({
+        "id": "resp_fit", "object": "response", "status": "completed", "model": "gpt-up",
+        "output": [{ "id": "msg_fit", "type": "message", "role": "assistant", "status": "completed",
+                     "content": [{ "type": "output_text", "text": "档位", "annotations": [] }] }],
+        "usage": { "input_tokens": 5, "output_tokens": 1 }
+    })
+    .to_string();
+    for (levels, expected) in [
+        (r#"[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]"#, "high"),
+        (
+            r#"[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]"#,
+            "xhigh",
+        ),
+    ] {
+        let (fit_base, fit_seen) =
+            mock_upstream(vec![(200, "application/json", fit_body.clone())]).await;
+        let mut fit_relay = relay("fit", &fit_base, "sk-fit", RelayProtocol::Responses, "gpt-up");
+        fit_relay.model_metadata =
+            format!(r#"{{"gpt-up":{{"supported_reasoning_levels":{levels}}}}}"#);
+        gateway.providers = providers(vec![fit_relay]);
+        save(&gateway);
+        let mut request = claude_request(false);
+        request["thinking"] = json!({ "type": "adaptive" });
+        request["output_config"] = json!({ "effort": "max" });
+        let (status, text) = post(port, "/gw/claude/v1/messages", token, &request).await;
+        assert_eq!(status, 200, "{text}");
+        let seen = fit_seen.lock().unwrap();
+        assert_eq!(seen[0].1["reasoning"]["effort"], expected, "levels: {levels}");
+    }
+
     // —— 4. Anthropic 上游原样转发 ——
     let anthropic_sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-up\",\"content\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string();
     let (anth_base, anth_seen) =
@@ -639,6 +671,49 @@ async fn gateway_end_to_end() {
         .map(|model| model["id"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["group/group", "deepseek-v4-pro", "glm-5.3"]);
+
+    // Claude Desktop：非 Claude 模型换成数字别名，真实名字在 display_name 里。
+    gateway.bindings.insert(
+        "claude-desktop".into(),
+        binding("deepseek-v4-pro", "cpx-gw-desktop-e2e"),
+    );
+    save(&gateway);
+    let models = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/gw/claude-desktop/v1/models"))
+        .bearer_auth("cpx-gw-desktop-e2e")
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let rows = models["data"].as_array().unwrap();
+    let names = rows
+        .iter()
+        .map(|row| row["display_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["deepseek-v4-pro", "glm-5.3", "group/group"]);
+    for row in rows {
+        let real = row["display_name"].as_str().unwrap();
+        let id = row["id"].as_str().unwrap();
+        // 有思考档位的模型用 mythos-gw- 别名（Desktop 才出思考等级菜单），其余仍是 claude-gw-；
+        // 数字部分与旧别名一致，旧会话选中的模型照样能还原。
+        let old = codex_plus_core::gateway::route::claude_alias(real);
+        let digits = old.strip_prefix("claude-gw-").unwrap();
+        assert!(
+            id == old || id == format!("mythos-gw-{digits}"),
+            "{real}: {id}"
+        );
+        assert_eq!(
+            id,
+            codex_plus_core::gateway::route::claude_desktop_alias(
+                real,
+                id.starts_with("mythos-gw-")
+            )
+        );
+    }
+    gateway.bindings.remove("claude-desktop");
+    save(&gateway);
 
     // —— 8. Grok：Responses 客户端 → Chat 上游，输出 Responses 事件流 ——
     let (grok_base, grok_seen) =
@@ -1168,6 +1243,158 @@ async fn gateway_end_to_end() {
         );
         assert_eq!(body["model"], "gpt-image-2");
     }
+
+    // —— 8f. 通用 Agent（OpenCode）：Chat Completions 与 Gemini 入站都经网关转给 Chat 上游 ——
+    let (generic_base, generic_seen) = mock_upstream(vec![
+        (200, "text/event-stream", chat_sse("通用流式")),
+        (
+            200,
+            "application/json",
+            json!({
+                "id": "c9", "object": "chat.completion", "model": "up",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "通用整段" }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12 }
+            })
+            .to_string(),
+        ),
+        (200, "text/event-stream", chat_tool_sse()),
+        (200, "text/event-stream", chat_sse("双子座")),
+    ])
+    .await;
+    gateway.providers = providers(vec![relay(
+        "generic",
+        &generic_base,
+        "sk-generic",
+        RelayProtocol::ChatCompletions,
+        "deepseek-v4-pro",
+    )]);
+    let generic_token = "cpx-gw-opencode-e2e";
+    gateway.bindings.insert(
+        "opencode".into(),
+        binding("deepseek-v4-pro", generic_token),
+    );
+    save(&gateway);
+    let chat_body = |stream: bool| {
+        json!({
+            "model": "generic/deepseek-v4-pro",
+            "stream": stream,
+            "stream_options": { "include_usage": true },
+            "messages": [
+                { "role": "system", "content": "你是助手" },
+                { "role": "user", "content": "你好" }
+            ],
+            "tools": [{ "type": "function", "function": { "name": "Bash", "parameters": { "type": "object", "properties": { "command": { "type": "string" } } } } }]
+        })
+    };
+    // 流式：标准 chat.completion.chunk，带 usage 块和 [DONE]。
+    let (status, text) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        generic_token,
+        &chat_body(true),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    let chunks = sse_events(&text);
+    let streamed: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(streamed, "通用流式");
+    assert!(
+        chunks.iter().any(|chunk| chunk["usage"]["total_tokens"].as_u64() == Some(25)),
+        "{text}"
+    );
+    {
+        let seen = generic_seen.lock().unwrap();
+        let (_, body) = &seen[0];
+        assert_eq!(body["model"], "deepseek-v4-pro");
+        assert_eq!(body["tools"][0]["function"]["name"], "Bash");
+    }
+    // 非流式：完整 chat.completion。
+    let (status, text) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        generic_token,
+        &chat_body(false),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let completion: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(completion["object"], "chat.completion");
+    assert_eq!(completion["choices"][0]["message"]["content"], "通用整段");
+    // 工具调用：tool_calls 增量、finish_reason = tool_calls。
+    let (status, text) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        generic_token,
+        &chat_body(true),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let chunks = sse_events(&text);
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Bash"),
+        "{text}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls"),
+        "{text}"
+    );
+    // Gemini：模型名带 `/`，Key 放在查询串里，流式回 GenerateContentResponse。
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/gw/opencode/v1beta/models/generic/deepseek-v4-pro:streamGenerateContent?alt=sse&key={generic_token}"
+        ))
+        .json(&json!({
+            "systemInstruction": { "parts": [{ "text": "你是助手" }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "你好" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let text = response.text().await.unwrap();
+    let gemini_text: String = text
+        .split("\r\n\r\n")
+        .flat_map(|block| block.split("\n\n"))
+        .filter_map(|block| block.trim().strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .filter_map(|event| {
+            event["candidates"][0]["content"]["parts"][0]["text"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(gemini_text, "双子座", "{text}");
+    // Gemini 本地计数，不发上游。
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/gw/opencode/v1beta/models/generic/deepseek-v4-pro:countTokens"
+        ))
+        .header("x-goog-api-key", generic_token)
+        .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "你好" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let counted: Value = response.json().await.unwrap();
+    assert!(counted["totalTokens"].as_u64().unwrap() > 0);
+    assert_eq!(generic_seen.lock().unwrap().len(), 4, "countTokens 不该发给上游");
+    // token 不对：401，OpenAI 风格的错误。
+    let (status, _) = post(
+        port,
+        "/gw/opencode/v1/chat/completions",
+        "wrong",
+        &chat_body(true),
+    )
+    .await;
+    assert_eq!(status, 401);
 
     // —— 9. 关闭绑定后返回 503，旧的 Codex 代理路径不受影响 ——
     gateway.bindings.get_mut("claude").unwrap().enabled = false;

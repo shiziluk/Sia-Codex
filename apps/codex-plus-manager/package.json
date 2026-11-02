@@ -1,6 +1,6 @@
 {
   "name": "codex-plus-manager",
-  "version": "2.1.4",
+  "version": "2.2.0",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -8,8 +8,10 @@
     "dev": "tauri dev",
     "build": "tauri build",
     "check": "tsc --noEmit -p tsconfig.json",
-    "test": "node --test \"src/*.test.ts\"",
+    "test": "node --test \"src/*.test.ts\" ../../scripts/tests/weixin-desktop-sync.test.cjs",
     "test:native-browser-local": "node scripts/test-native-browser-fixtures.mjs",
+    "claim:workbuddy": "node scripts/workbuddy-daily-claim.mjs",
+    "claim:trae": "node scripts/trae-daily-claim.mjs",
     "vite:dev": "vite --host 127.0.0.1 --port 1420",
     "vite:build": "vite build"
   },

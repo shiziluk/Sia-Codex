@@ -550,6 +550,7 @@ struct CatalogRepairThread {
 struct CatalogRepairObservedThread {
     thread: CatalogRepairThread,
     eligible: bool,
+    excluded_by_metadata: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -5762,6 +5763,7 @@ fn collect_catalog_repair_plan(
         let git_branch = text_expr(&columns, "git_branch", "NULL");
         let thread_source = text_expr(&columns, "thread_source", "NULL");
         let archived = text_expr(&columns, "archived", "0");
+        let history_mode = text_expr(&columns, "history_mode", "'legacy'");
         // Current app-server listing uses preview; paginated histories can retain a zero
         // legacy user-event flag even when they contain real user messages.
         let has_user_content = if columns.contains("preview") {
@@ -5772,7 +5774,7 @@ fn collect_catalog_repair_plan(
         let agent_role = text_expr(&columns, "agent_role", "''");
         let subagent_filter = subagent_filter(&db, "threads.id")?;
         let sql = format!(
-            "SELECT id, {display_title}, {source_created_at}, {source_updated_at}, {cwd}, {source_kind}, {source_detail}, {git_branch}, {thread_source}, {archived}, {has_user_content}, {agent_role} FROM threads WHERE COALESCE(id, '') <> ''{subagent_filter}"
+            "SELECT id, {display_title}, {source_created_at}, {source_updated_at}, {cwd}, {source_kind}, {source_detail}, {git_branch}, {thread_source}, {archived}, {has_user_content}, {agent_role}, {history_mode} FROM threads WHERE COALESCE(id, '') <> ''{subagent_filter}"
         );
         let mut stmt = db.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
@@ -5794,10 +5796,11 @@ fn collect_catalog_repair_plan(
                 row.get::<_, i64>(9).unwrap_or_default(),
                 row.get::<_, i64>(10).unwrap_or(1),
                 row.get::<_, String>(11).unwrap_or_default(),
+                row.get::<_, String>(12).unwrap_or_default(),
             ))
         })?;
         for item in rows {
-            let (thread, archived, has_user_content, agent_role) = item?;
+            let (thread, archived, has_user_content, agent_role, history_mode) = item?;
             // issue #2199：删除墓碑一票否决。资格判定里没有「删除态」，只要 rollout
             // 文件还在（删除失败或被别的进程锁住等），被删的会话就会被重新插回 catalog。
             // 在收集阶段直接跳过，它既不进候选，也不会在下面的择优平局里胜出。
@@ -5811,29 +5814,35 @@ fn collect_catalog_repair_plan(
                 });
             let non_root = is_catalog_non_root_agent(&thread, &spawned_child_ids);
             let source_is_exec = thread.source_kind.trim().eq_ignore_ascii_case("exec");
-            let rollout_exists = catalog_rollout_path_exists(home, &thread.source_detail);
-            let eligible = archived == 0
-                && has_user_content == 1
-                && agent_role.trim().is_empty()
-                && !marked_non_user
-                && !source_is_exec
-                && !non_root
-                && rollout_exists;
+            // 原生分页迁移把历史存进 SQLite 后，可能删掉 JSONL。
+            let history_available = history_mode == "paginated"
+                || catalog_rollout_path_exists(home, &thread.source_detail);
+            let excluded_by_metadata = archived != 0
+                || has_user_content != 1
+                || !agent_role.trim().is_empty()
+                || marked_non_user
+                || source_is_exec
+                || non_root;
+            let eligible = !excluded_by_metadata && history_available;
             let replace = observed_threads
                 .get(&thread.id)
                 .map(|current: &CatalogRepairObservedThread| {
-                    // Copies can share a timestamp; an ineligible observation wins the tie so
-                    // an archived or agent-owned thread cannot be resurrected by a stale copy.
+                    // 时间戳相同时元数据排除优先；只缺旧版存储不能否决
+                    // 同样新、且历史可用的副本。
                     thread.source_updated_at > current.thread.source_updated_at
                         || (thread.source_updated_at == current.thread.source_updated_at
-                            && !eligible
-                            && current.eligible)
+                            && (excluded_by_metadata, eligible)
+                                > (current.excluded_by_metadata, current.eligible))
                 })
                 .unwrap_or(true);
             if replace {
                 observed_threads.insert(
                     thread.id.clone(),
-                    CatalogRepairObservedThread { thread, eligible },
+                    CatalogRepairObservedThread {
+                        thread,
+                        eligible,
+                        excluded_by_metadata,
+                    },
                 );
             }
         }

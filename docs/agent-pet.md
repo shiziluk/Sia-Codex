@@ -1,10 +1,16 @@
 # Agent 桌宠
 
-在 Codex 里放一只可拖动的桌宠。点击时会压扁再弹回，并播放按压 / 松开音效。
+在 Codex 里放一只可拖动的桌宠。桌宠有两种类型，二选一、同一时间只显示一个：
+
+- **简单桌宠**（默认）：点击时会压扁再弹回，并播放按压 / 松开音效，图片可从图库挑或用自己的；
+- **大肥鱼（DeepSeek 鲸鱼）**：完整的旧版鲸鱼用量挂件，含余额、价格 / 用量统计、泡泡编辑器、音效库和提醒，
+  说明见 [大肥鱼（Codex 用量挂件）](whale-widget.md)。
 
 ## 开启
 
-打开管理器「Agent 桌宠」页，打开开关即可，默认关闭。目前只支持 Codex，其他 Agent 之后再补。
+Agent 桌宠是随 Codex++ 一起发布的官方拓展包（「万物皆拓展 → 本地拓展」里的「Agent 桌宠」，来源 `bundled`，
+脚本 key `bundled:agent-pet`），可以停用、不能删除。打开管理器「Agent 桌宠」页，打开开关即可（开关就是这个拓展的启停），
+默认关闭。目前只支持 Codex，其他 Agent 之后再补。「启用本地拓展」整体开关关着时桌宠也不显示。
 
 页面里可以设置：
 
@@ -12,8 +18,17 @@
 - **大小**：64–240 像素，默认 112；
 - **音效**：开关、音效组和音量。音效组可选内嵌的两组、可下载的二次元音效，或导入本地音频作为自定义按压 / 松开音。
 
-设置保存在 `settings.json` 的 `agentPet` 字段。旧版「用量挂件」开着的用户升级后，桌宠会自动开启；
-旧挂件的余额、价格、用量统计已经移除，相关设置在下次保存时清理。
+选了大肥鱼时，页面只显示它的「API 余额（可选）」配置，其余设置在 Codex 里点鲸鱼旁的菜单完成。
+
+设置保存在这个拓展的配置里（`user_scripts.json` 的 `configs["bundled:agent-pet"]`），`kind` 为 `image`（简单桌宠）
+或 `whaleWidget`（大肥鱼），缺省或未知值按简单桌宠处理；管理器保存后 Codex 里的桌宠原地生效，不用重启。
+
+从内置桌宠升级：第一次启动新版时，`settings.json` 里原来的 `agentPet` 与 `codexAppWhaleBalance*` 换算成拓展配置，
+开关照原来的开 / 关，之后只读写拓展配置（只迁移一次）。更早的迁移规则（同样体现在换算前的 `agentPet` 上）：
+
+- 旧版「Codex 用量挂件」（`codexAppWhaleWidgetEnabled`）开着、还没有 `agentPet` 的用户：桌宠开启并选中大肥鱼，
+  余额配置 `codexAppWhaleBalance*` 原样保留，旧开关在下次保存时清理；
+- 已经有 `agentPet` 的用户保持现状（没有 `kind` 的仍是简单桌宠）。
 
 ## 图片
 
@@ -69,7 +84,14 @@
 
 - 设置：`crates/codex-plus-core/src/settings.rs` 的 `AgentPetSettings`；
 - 图库与下载：`crates/codex-plus-core/src/agent_pet.rs`；
-- 渲染进程取图 / 取音效：桥接路由 `/agent-pet/image`、`/agent-pet/sound`（内置功能专用，不开放给第三方拓展）；
+- 拓展包源码：`assets/extensions/agent-pet/`（`pet.js` 图片桌宠、`whale-compat.js` / `whale.js` 大肥鱼、`main.js` 入口），
+  嵌进程序并在第一次用到时写到 `<配置目录>/bundled_extensions/agent-pet/`（`crates/codex-plus-core/src/bundled_extensions.rs`）；
+  大肥鱼的上游引擎写成包里的 `whale-engine.js`，内嵌音效写成 `assets/sounds/`；
+- 取图 / 取音效：路由 `/agent-pet/image`、`/agent-pet/sound`，参数来自拓展配置，按原来的设置规则校验；
+  只有启用中的拓展在清单里声明了这条路由时才干活；
 - 管理器命令：`agent_pet_catalog`、`agent_pet_image`、`agent_pet_sounds`、`agent_pet_sound_catalog`、
   `agent_pet_sound`、`agent_pet_import_sound`；
-- 渲染进程界面：`assets/inject/renderer-inject/97-agent-pet.js`。
+- 页面侧只用公开拓展接口（overlay 插槽、`ctx.config` / `onConfigUpdate`、`ctx.asset`、`ctx.call`、`ctx.on("codex/…")`、
+  `codexPlus.currentSession()`）；两种桌宠都按配置的 `kind` 判断，选中另一种时不挂载。
+- 大肥鱼的数据：路由 `/whale/media`（内嵌素材）、`/whale/full`（挂件设置、图库、余额与用量，请求里带拓展配置的余额设置）、
+  `/whale/history`、`/whale/session`（本机 Codex 用量）。供应商 Key 只在 Codex++ 里用，不交给页面。

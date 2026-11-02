@@ -74,6 +74,10 @@ pub struct GatewayProvider {
     /// 和 Key 一样只存在 gateway.json，界面只拿到打码后的样子。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newapi_access: Option<crate::relay_billing::NewApiAccess>,
+    /// 上次「从上游同步上下文窗口 / 思考等级」写进去的值（#2807）。
+    /// 现值和这里一样说明是同步来的，下次同步默认可覆盖；不一样就是用户手动改过的，默认不覆盖。
+    #[serde(default, skip_serializing_if = "UpstreamMetaRecord::is_empty")]
+    pub upstream_meta: UpstreamMetaRecord,
     pub relay: RelayProfile,
     /// 不认识的字段（更新版本写的）原样保留，保存时写回，回滚后再升级不丢数据。
     #[serde(flatten)]
@@ -82,6 +86,39 @@ pub struct GatewayProvider {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// 从上游同步写入的模型资料记录（#2807），键是小写、去掉 `[1M]` 后缀的模型名。
+/// 只用来区分「同步来的」和「用户手动设的」，不参与路由和 Agent 配置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamMetaRecord {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub windows: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning: BTreeMap<String, SyncedReasoning>,
+}
+
+impl UpstreamMetaRecord {
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty() && self.reasoning.is_empty()
+    }
+
+    /// 去掉 `gone` 判定为已删除的模型的记录。
+    pub fn retain_models(&mut self, keep: impl Fn(&str) -> bool) {
+        self.windows.retain(|model, _| keep(model));
+        self.reasoning.retain(|model, _| keep(model));
+    }
+}
+
+/// 同步写入的一组思考等级。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncedReasoning {
+    #[serde(default)]
+    pub levels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_level: Option<String>,
 }
 
 impl GatewayProvider {
@@ -490,6 +527,10 @@ pub struct GatewaySettings {
     /// 关掉时名字后面换成看不见的字符：分组脚本照样能分清是哪一家，界面上只显示模型名。
     #[serde(default = "enabled_by_default")]
     pub model_suffix: bool,
+    /// 发现本机已登录的订阅账号（Kiro、Cursor、Gemini CLI 等官方客户端的登录文件）：
+    /// 开着时供应商页提示可以导入。默认关（opt-in）：关着时不读这些登录文件。
+    #[serde(default)]
+    pub local_login_discovery: bool,
     /// 自动组上改过的设置（键是小写模型名）。没改过的自动组不落盘，跟着供应商池自动变化。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub auto_groups: BTreeMap<String, AutoGroupSettings>,
@@ -503,6 +544,9 @@ pub struct GatewaySettings {
     /// 生图结果只给链接时原样转发、不下载成图片数据的 Agent（默认都转，见 [`Self::inline_image_urls_for`]）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_keep_urls: Vec<String>,
+    /// 模型下拉里不列自带模型（直连，不经 Codex++）的 Agent（默认都列，见 [`Self::shows_own_models_for`]）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hide_own_models: Vec<String>,
     /// 旧版的全局生图模型，读的时候迁移给 Codex（见 [`read_store`]），之后不再写。
     #[serde(default, skip_serializing)]
     pub image_model: String,
@@ -532,10 +576,12 @@ impl Default for GatewaySettings {
             lightweight_on_close: false,
             auto_models: true,
             model_suffix: true,
+            local_login_discovery: false,
             auto_groups: BTreeMap::new(),
             favorite_models: Vec::new(),
             image_models: BTreeMap::new(),
             image_keep_urls: Vec::new(),
+            hide_own_models: Vec::new(),
             image_model: String::new(),
             app_version: String::new(),
             extra: Map::new(),
@@ -561,6 +607,11 @@ impl GatewaySettings {
     /// 这个 Agent 的生图结果只给链接时，要不要下载下来补成 `b64_json`。
     pub fn inline_image_urls_for(&self, agent: &ToolId) -> bool {
         !self.image_keep_urls.iter().any(|id| id == agent.as_str())
+    }
+
+    /// 这个 Agent 的模型下拉里要不要列它自带的模型。
+    pub fn shows_own_models_for(&self, agent: &ToolId) -> bool {
+        !self.hide_own_models.iter().any(|id| id == agent.as_str())
     }
 
     pub fn group(&self, id: &str) -> Option<&GatewayGroup> {
@@ -619,6 +670,142 @@ impl Default for GatewayStore {
             path: Self::default_path(),
         }
     }
+}
+
+impl GatewaySettings {
+    /// 并入拓展声明的模型供应商（不落盘）：来源记为 `extension:<拓展 id>`，与已有供应商同 id 时以已有的为准，
+    /// 拓展写了 `override: true` 时顶替已有的（位置不变）。
+    /// 只在构建 Agent 的模型资料与网关路由这些只读的地方调用，不要在读-改-写里用，免得写进 gateway.json。
+    ///
+    /// 网关每个请求都会走到这里：拓展目录的扫描结果缓存 3 秒，拓展启停、改配置后很快生效。
+    pub fn with_extension_providers(self) -> Self {
+        type Cached = (std::time::Instant, Vec<(String, crate::user_scripts::ExtensionProvider)>);
+        static CACHE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+        let providers = {
+            let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match cache.as_ref() {
+                Some((at, list)) if at.elapsed() < std::time::Duration::from_secs(3) => list.clone(),
+                _ => {
+                    let list = crate::user_scripts::default_user_script_manager()
+                        .enabled_extension_providers()
+                        .unwrap_or_default();
+                    *cache = Some((std::time::Instant::now(), list.clone()));
+                    list
+                }
+            }
+        };
+        self.merge_extension_providers(providers)
+    }
+
+    pub fn with_extension_providers_from(self, manager: &crate::user_scripts::UserScriptManager) -> Self {
+        let providers = manager.enabled_extension_providers().unwrap_or_default();
+        self.merge_extension_providers(providers)
+    }
+
+    fn merge_extension_providers(mut self, providers: Vec<(String, crate::user_scripts::ExtensionProvider)>) -> Self {
+        for (extension, mut provider) in providers {
+            let existing = self.providers.iter().position(|existing| existing.relay.id == provider.id);
+            if existing.is_some() && !provider.override_existing {
+                continue;
+            }
+            if provider.discover_models {
+                for model in discovered_extension_models(&provider) {
+                    if !provider.models.contains(&model) {
+                        provider.models.push(model);
+                    }
+                }
+            }
+            let relay = RelayProfile {
+                id: provider.id.clone(),
+                name: provider.name.clone(),
+                base_url: provider.base_url.clone(),
+                api_key: provider.api_key.clone(),
+                no_auth: provider.api_key.is_empty(),
+                protocol: match provider.protocol.as_str() {
+                    "chat" => crate::settings::RelayProtocol::ChatCompletions,
+                    "anthropic" => crate::settings::RelayProtocol::AnthropicMessages,
+                    _ => crate::settings::RelayProtocol::Responses,
+                },
+                model: provider.models.first().cloned().unwrap_or_default(),
+                model_list: provider.models.join("\n"),
+                ..RelayProfile::default()
+            };
+            let entry = GatewayProvider {
+                enabled: true,
+                source: format!("extension:{extension}"),
+                price: None,
+                model_prices: BTreeMap::new(),
+                model_windows: BTreeMap::new(),
+                context_window: None,
+                proxy: String::new(),
+                key_rpm: None,
+                key_concurrency: None,
+                upstream_new: Vec::new(),
+                upstream_gone: Vec::new(),
+                models_checked_at_ms: 0,
+                newapi_access: None,
+                upstream_meta: Default::default(),
+                relay,
+                extra: Map::new(),
+            };
+            match existing {
+                Some(index) => self.providers[index] = entry,
+                None => self.providers.push(entry),
+            }
+        }
+        self
+    }
+}
+
+/// 拓展供应商从上游拉到的模型：供应商 id + 地址 → (拉取时间, 模型)。过期就在后台重拉，这次先用旧的。
+type DiscoveredModels = std::collections::HashMap<String, (std::time::Instant, Vec<String>)>;
+static DISCOVERED_MODELS: std::sync::LazyLock<std::sync::Mutex<DiscoveredModels>> = std::sync::LazyLock::new(Default::default);
+const DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn discovered_extension_models(provider: &crate::user_scripts::ExtensionProvider) -> Vec<String> {
+    let key = format!("{}|{}", provider.id, provider.base_url);
+    let (models, stale) = {
+        let mut cache = DISCOVERED_MODELS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match cache.get(&key) {
+            Some((at, models)) => (models.clone(), at.elapsed() > DISCOVERY_TTL),
+            None => {
+                // 先占位，免得并发请求各拉一遍。
+                cache.insert(key.clone(), (std::time::Instant::now(), Vec::new()));
+                (Vec::new(), true)
+            }
+        }
+    };
+    if stale {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let relay = RelayProfile {
+                id: provider.id.clone(),
+                base_url: provider.base_url.clone(),
+                api_key: provider.api_key.clone(),
+                no_auth: provider.api_key.is_empty(),
+                protocol: match provider.protocol.as_str() {
+                    "chat" => crate::settings::RelayProtocol::ChatCompletions,
+                    "anthropic" => crate::settings::RelayProtocol::AnthropicMessages,
+                    _ => crate::settings::RelayProtocol::Responses,
+                },
+                ..RelayProfile::default()
+            };
+            DISCOVERED_MODELS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(key.clone()).and_modify(|entry| entry.0 = std::time::Instant::now());
+            handle.spawn(async move {
+                match crate::gateway::model_sync::upstream_models(&relay).await {
+                    Ok(models) => {
+                        DISCOVERED_MODELS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(key, (std::time::Instant::now(), models));
+                    }
+                    Err(error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "extension_providers.discover_failed",
+                            serde_json::json!({ "provider": relay.id, "error": format!("{error:#}") }),
+                        );
+                    }
+                }
+            });
+        }
+    }
+    models
 }
 
 impl GatewayStore {
@@ -988,6 +1175,7 @@ mod tests {
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
             newapi_access: None,
+            upstream_meta: Default::default(),
             relay: RelayProfile {
                 id: "deepseek".to_string(),
                 ..RelayProfile::default()
