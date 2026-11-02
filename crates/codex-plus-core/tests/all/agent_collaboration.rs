@@ -509,7 +509,8 @@ fn mcp_protocol_keeps_errors_per_request_and_never_exposes_configuration_mutatio
             "sansheng_accept",
             "sansheng_cancel",
             "sansheng_resolve_conflict",
-            "sansheng_retry_merge"
+            "sansheng_retry_merge",
+            "delegate_to_doubao"
         ]
     );
     let rejected = mcp::handle_request(&store, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send_task","arguments":request(&temp,"codex")}})).unwrap();

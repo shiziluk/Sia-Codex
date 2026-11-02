@@ -203,6 +203,8 @@ fn task(id: &str, updated_at_ms: u64) -> TaskRecord {
         updated_at_ms,
         cancel_requested: true,
         progress: "SECRET_PROGRESS".to_string(),
+        workflow_id: None,
+        role: String::new(),
     }
 }
 
