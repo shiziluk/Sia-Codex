@@ -287,6 +287,28 @@ pub async fn computer_use_browser_extension_status() -> CommandResult<Value> {
                     extension_installed = true;
                     break;
                 }
+                // Edge 允许从官方 CRX 解包后“加载解压缩扩展”。这类扩展
+                // 写在 Secure Preferences / Preferences，不在 Extensions/ 下。
+                for name in ["Secure Preferences", "Preferences"] {
+                    let path = entry.path().join(name);
+                    let Ok(metadata) = std::fs::metadata(&path) else {
+                        continue;
+                    };
+                    if metadata.len() > 32 * 1024 * 1024 {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(path) else {
+                        continue;
+                    };
+                    let text = String::from_utf8_lossy(&bytes);
+                    if EXT_IDS.iter().any(|id| text.contains(id)) {
+                        extension_installed = true;
+                        break;
+                    }
+                }
+                if extension_installed {
+                    break;
+                }
             }
         }
         json!({
