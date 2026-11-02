@@ -357,6 +357,7 @@ fn delegation_request(store: &Store, name: &str, arguments: Value) -> anyhow::Re
         "delegate_to_codex" => "codex",
         "delegate_to_workbuddy" => "workbuddy",
         "delegate_to_trae" => "trae",
+        "delegate_to_doubao" => "doubao",
         _ => anyhow::bail!("未知委派工具"),
     };
     let arguments: FixedDelegateArguments = serde_json::from_value(arguments)
@@ -460,7 +461,8 @@ fn call_tool(store: &Store, name: &str, arguments: Value) -> anyhow::Result<Valu
         | "delegate_to_claude_code"
         | "delegate_to_codex"
         | "delegate_to_workbuddy"
-        | "delegate_to_trae" => dispatch_task(store, delegation_request(store, name, arguments)?),
+        | "delegate_to_trae"
+        | "delegate_to_doubao" => dispatch_task(store, delegation_request(store, name, arguments)?),
         "send_task" => {
             let request: TaskRequest =
                 serde_json::from_value(arguments).context("send_task 参数无效")?;
@@ -599,6 +601,8 @@ fn tool_definitions() -> Vec<Value> {
     }, "required": ["prompt", "cwd"], "additionalProperties": false});
     let mut delegate_schema = fixed_schema.clone();
     delegate_schema["properties"]["agentId"] = json!({"type": "string", "enum": ["codex", "deepseek", "claude", "workbuddy", "trae"], "description": "可选；省略时使用 Codex++ 默认 Agent，明确指定时优先使用该目标"});
+    delegate_schema["properties"]["agentId"]["enum"] =
+        json!(["codex", "deepseek", "claude", "workbuddy", "trae", "doubao"]);
     let mut send_schema = delegate_schema.clone();
     send_schema["required"] = json!(["agentId", "prompt", "cwd"]);
     let dispatch_annotations =
@@ -634,6 +638,12 @@ fn tool_definitions() -> Vec<Value> {
         json!({"name": "sansheng_resolve_conflict", "description": "在 merge_conflict 状态下逐文件记录冲突决定。choice=ours 保留当前集成版本；choice=theirs 采用当前任务版本；choice=custom 使用 content 作为手工合并结果。全部冲突文件选择后再调用 sansheng_retry_merge；主分支在合并成功前保持不变。", "inputSchema": {"type": "object", "properties": {"workflowId": {"type": "string"}, "controllerId": {"type": "string"}, "file": {"type": "string", "minLength": 1}, "choice": {"type": "string", "enum": ["ours", "theirs", "custom"]}, "content": {"type": "string", "maxLength": 524288, "description": "choice=custom 时的最终 UTF-8 文件内容"}}, "required": ["workflowId", "controllerId", "file", "choice"], "additionalProperties": false}, "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true}}),
         json!({"name": "sansheng_retry_merge", "description": "在 merge_conflict 状态下，用户修正对应 worktree 分支后重新执行自动合并。主分支在成功前保持不变。", "inputSchema": {"type": "object", "properties": {"workflowId": {"type": "string"}, "controllerId": {"type": "string"}}, "required": ["workflowId", "controllerId"], "additionalProperties": false}, "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false}}),
     ]);
+    tools.push(json!({
+        "name": "delegate_to_doubao",
+        "description": "把研究、整理或第二意见交给无窗口运行的豆包工作。驱动复用本机豆包登录态，通过本地 CDP 提交任务并读取答案；未登录时明确失败，不启动可见主窗口。只有 completed 才表示成功。",
+        "inputSchema": fixed_schema,
+        "annotations": dispatch_annotations
+    }));
     tools
 }
 
@@ -687,6 +697,7 @@ mod tests {
             ("delegate_to_codex", "codex"),
             ("delegate_to_workbuddy", "workbuddy"),
             ("delegate_to_trae", "trae"),
+            ("delegate_to_doubao", "doubao"),
         ] {
             let mut config = store.config().unwrap();
             config.default_agent_id = if expected == "codex" {

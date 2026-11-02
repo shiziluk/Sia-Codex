@@ -24,7 +24,7 @@ This README focuses on downstream differences. General provider, gateway, sessio
 
 The Agent orchestration page includes a unified worker view for:
 
-- Codex, DeepSeek Harness, Claude Code, WorkBuddy, and Trae CN.
+- Codex, DeepSeek Harness, Claude Code, WorkBuddy, Trae CN, and Doubao Work.
 - Executable availability, enabled state, model, concurrency, live queue state, and latest task.
 - Authentication and quota status. When no stable query API exists, the UI says “verified at execution time” instead of inventing a status.
 - **Test connection**, which submits a read-only `WORKER_OK` probe.
@@ -38,6 +38,7 @@ A queued, timed-out, `handed_off`, or uncertain task is not success.
 - Routine separable work prefers WorkBuddy, Trae CN, native subagents, and idle free-model channels.
 - WorkBuddy starts with `hy3`, may use `hy4-preview` during early morning, and falls back to `GLM-5.3-Flash`.
 - Trae prefers `GLM-5.3-Flash`.
+- Doubao Work is launched with `--headless=new` and controlled through local CDP using its existing login. The client must be signed in once before use; unauthenticated tasks fail explicitly.
 - DeepSeek Harness and Claude Code use paid online models and are not default workers.
 - WorkBuddy and Trae do not currently expose a stable thinking-effort API. Using Flash models reduces cost, but the adapters do not claim to forward a minimum thinking level. Use an API/provider with explicit effort controls when that guarantee is required.
 
@@ -75,6 +76,14 @@ Extension code runs with the current user's permissions and without a sandbox. I
 | Full extension system | Supported | Supported | Supported |
 
 Costs depend on each worker's account, model, and quota. Codex++ does not guarantee free quota and does not bypass third-party daily claim or risk-control flows.
+
+WorkBuddy's daily 100-credit entry is `Buddy加油站 → 每日可领 100 积分 → 立即领取`, backed by `/billing/meter/checkin-status` and `/billing/meter/daily-checkin`. Trae exposes its daily reward in the account menu as `每日签到得 100 积分 → 签到`. Both scripts are idempotent and return success only after an explicit claimed state:
+
+```powershell
+$env:WORKBUDDY_EXE = "F:\智能体\WorkBuddy\app\WorkBuddy.exe"
+npm.cmd run claim:workbuddy --prefix apps/codex-plus-manager
+npm.cmd run claim:trae --prefix apps/codex-plus-manager
+```
 
 ## Update Policy
 

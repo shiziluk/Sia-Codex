@@ -13,6 +13,7 @@ test("agent orchestration page exposes overview and visible task console", () =>
   assert.match(page, /执行记录与结果/);
   assert.match(page, /WorkBuddy/);
   assert.match(page, /Trae CN/);
+  assert.match(page, /豆包工作/);
   assert.match(page, /handed_off/);
   assert.match(page, /dependsOn/);
   assert.match(page, /workspaceMode/);

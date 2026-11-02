@@ -30,7 +30,7 @@ Sia-Codex 是 [CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的�
 
 Agent 编排台新增独立的 **Worker 控制中心**，统一显示：
 
-- Codex、DeepSeek Harness、Claude Code、WorkBuddy、Trae CN 的可执行文件与启用状态。
+- Codex、DeepSeek Harness、Claude Code、WorkBuddy、Trae CN、豆包工作的可执行文件与启用状态。
 - 模型、并发数、当前排队/运行数和最近一次任务。
 - 认证与额度的实际状态。没有稳定查询接口时明确显示“执行时验证”，不会伪造已登录或剩余额度。
 - **测试连接**：提交 `WORKER_OK` 只读探针任务。
@@ -44,6 +44,7 @@ Agent 编排台新增独立的 **Worker 控制中心**，统一显示：
 - 日常可拆分工作优先使用 WorkBuddy、Trae CN、原生子代理和空闲的免费模型通道。
 - WorkBuddy 默认从 `hy3` 开始；凌晨可加入 `hy4-preview`；不可用时切到 `GLM-5.3-Flash`。
 - Trae 优先使用 `GLM-5.3-Flash`。
+- 豆包工作通过 `--headless=new` 和本地 CDP 接入，复用客户端登录态；首次使用前需在豆包工作中登录一次，未登录时任务会明确失败。
 - DeepSeek Harness 和 Claude Code 使用付费在线模型，不作为默认 Worker。
 - WorkBuddy 与 Trae 当前没有公开的思考强度 API。选择 Flash 快速档可降低推理成本，但适配器不会伪称已透传“最低思考强度”；需要严格强度控制时使用支持该参数的 API/供应商。
 
@@ -81,6 +82,14 @@ Agent 编排台新增独立的 **Worker 控制中心**，统一显示：
 | 完整拓展系统 | 支持 | 支持 | 支持 |
 
 费用由各 Worker 自己的账号、模型和额度决定。Codex++ 不保证免费额度始终存在，也不会绕过第三方客户端的每日领取或风控流程。
+
+WorkBuddy 的每日 100 积分入口已定位为 `Buddy加油站 → 每日可领 100 积分 → 立即领取`，底层对应 `/billing/meter/checkin-status` 与 `/billing/meter/daily-checkin`。Trae 的入口是账号菜单中的 `每日签到得 100 积分 → 签到`。两个脚本都做幂等检查，只有看到“领取成功 / 签到成功 / 已领取 / 已签到”才返回成功：
+
+```powershell
+$env:WORKBUDDY_EXE = "F:\智能体\WorkBuddy\app\WorkBuddy.exe"
+npm.cmd run claim:workbuddy --prefix apps/codex-plus-manager
+npm.cmd run claim:trae --prefix apps/codex-plus-manager
+```
 
 ## 更新策略
 

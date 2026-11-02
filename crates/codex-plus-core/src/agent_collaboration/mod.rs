@@ -148,6 +148,7 @@ impl Default for CollaborationConfig {
                 ("claude", "Claude Code"),
                 ("workbuddy", "WorkBuddy"),
                 ("trae", "Trae CN"),
+                ("doubao", "豆包工作"),
             ]
             .into_iter()
             .map(|(id, name)| AgentConfig {
@@ -748,7 +749,7 @@ impl Store {
         }
         if !matches!(
             request.agent_id.as_str(),
-            "codex" | "deepseek" | "claude" | "workbuddy" | "trae"
+            "codex" | "deepseek" | "claude" | "workbuddy" | "trae" | "doubao"
         ) {
             bail!("不支持的 agent；仅支持 codex、deepseek、claude、workbuddy、trae");
         }
@@ -1603,7 +1604,7 @@ fn normalize_config(config: CollaborationConfig) -> anyhow::Result<Collaboration
     normalized.default_agent_id = config.default_agent_id.trim().to_string();
     if !matches!(
         normalized.default_agent_id.as_str(),
-        "codex" | "deepseek" | "claude" | "workbuddy" | "trae"
+        "codex" | "deepseek" | "claude" | "workbuddy" | "trae" | "doubao"
     ) {
         bail!("默认子 Agent 必须是 Codex、DeepSeek Harness、Claude Code、WorkBuddy 或 Trae CN");
     }
