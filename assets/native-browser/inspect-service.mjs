@@ -6,6 +6,7 @@ const traverse = traverseModule.default ?? traverseModule;
 const protocolShapes = new Set([
   "5bf64da3b8386af46a6fb2c2d8829a507130ba9896237a813b8e04c4ce8eb515",
   "eae1b49427aebf3ed3d1119de1c303125c4f78b3b0ca644f055ed07ec2c2be30",
+  "00ca393ac6b0b761fae174840acaaf1a2fe467c2e07ce32b2df1490be330853a",
 ]);
 
 function requireContract(condition, message) {
@@ -104,35 +105,102 @@ function adaptiveRequest(send) {
     "Ambiguous request identification contract");
 }
 
+function adaptiveManagedRequest(send) {
+  requireContract(send.node.async && send.node.params.length >= 2 &&
+    send.node.params.slice(0, 2).every(p => p.type === "Identifier"),
+  "Changed managed request signature");
+  const command = send.scope.getBinding(send.node.params[0].name);
+  const payload = send.scope.getBinding(send.node.params[1].name);
+  requireContract(command?.constant && payload?.constant, "Rebound managed request arguments");
+  let session, headers;
+  let callbacks = 0, forwarding = 0, headerWrites = 0;
+  send.traverse({
+    VariableDeclarator(p) {
+      const init = p.get("init");
+      if (init.isCallExpression() && member(init.node.callee, "getSessionParams")) {
+        requireContract(!session && p.get("id").isIdentifier() &&
+          init.node.arguments.length === 0, "Ambiguous managed session parameters");
+        session = p.scope.getBinding(p.node.id.name);
+      }
+    },
+  });
+  requireContract(session?.constant, "Missing stable managed session parameters");
+  send.traverse({
+    CallExpression(p) {
+      if (member(p.node.callee, "readRequestHeaders")) {
+        callbacks++;
+        requireContract(p.node.arguments.length === 0 &&
+          p.parentPath.isAwaitExpression(), "Changed managed policy invocation");
+        const declaration = p.findParent(q => q.isVariableDeclarator());
+        requireContract(declaration?.get("id").isIdentifier(), "Missing managed header decision");
+        headers = declaration.scope.getBinding(declaration.node.id.name);
+        requireContract(headers?.constant, "Rebound managed header decision");
+      }
+      if (member(p.node.callee, "sendRequest")) {
+        forwarding++;
+        const args = p.get("arguments");
+        requireContract(args.length === 2 && boundIdentifier(args[0], command) &&
+          args[1].isObjectExpression(), "Changed managed request forwarding");
+        const properties = args[1].get("properties");
+        const spreads = properties.filter(q => q.isSpreadElement()).map(q => q.get("argument"));
+        requireContract(properties.length === 2 && spreads.length === 2 &&
+          boundIdentifier(spreads[0], payload) && boundIdentifier(spreads[1], session),
+        "Missing managed request or session parameters");
+      }
+    },
+  });
+  send.traverse({
+    AssignmentExpression(p) {
+      const left = p.get("left");
+      if (!left.isMemberExpression() || left.node.computed ||
+          left.node.property.name !== "request_headers" ||
+          !boundIdentifier(left.get("object"), session)) return;
+      headerWrites++;
+      const right = p.get("right");
+      requireContract(right.isCallExpression() && right.node.arguments.length === 1,
+        "Changed managed request-header data flow");
+      const value = right.get("arguments.0");
+      requireContract(value.isLogicalExpression() && value.node.operator === "??" &&
+        boundIdentifier(value.get("left"), headers) && value.get("right").isArrayExpression() &&
+        value.node.right.elements.length === 0, "Changed managed request-header fallback");
+    },
+  });
+  requireContract(callbacks === 1 && forwarding === 1 && headerWrites === 1,
+    "Ambiguous managed request-header contract");
+}
+
 function requestMethod(methods) {
   const info = methods.filter(p => p.isClassMethod() && !p.node.computed &&
     p.node.key.name === "getInfo");
   requireContract(info.length === 1 && info[0].node.async, "Ambiguous browser handshake");
-  let methodName, result, calls = 0, stores = 0;
+  let methodName, calls = 0, stores = 0;
   info[0].traverse({
-    VariableDeclarator(p) {
-      const awaited = p.get("init");
-      if (!awaited.isAwaitExpression()) return;
-      const call = awaited.get("argument");
-      if (!call.isCallExpression() || call.node.arguments[0]?.value !== "getInfo") return;
-      requireContract(call.node.callee.type === "MemberExpression" &&
-        !call.node.callee.computed && call.node.callee.object.type === "ThisExpression" &&
-        p.get("id").isIdentifier(), "Changed browser handshake request");
+    CallExpression(p) {
+      if (p.node.callee?.type !== "MemberExpression" || p.node.callee.computed ||
+          p.node.callee.object.type !== "ThisExpression" ||
+          p.node.arguments.length !== 2 || p.node.arguments[0]?.value !== "getInfo" ||
+          p.node.arguments[1]?.type !== "ObjectExpression") return;
+      const candidate = p.node.callee.property.name;
+      requireContract(methodName === undefined || methodName === candidate,
+      "Changed browser handshake request");
       calls++;
-      methodName = call.node.callee.property.name;
-      result = p.scope.getBinding(p.node.id.name);
+      methodName = candidate;
     },
   });
   info[0].traverse({
     AssignmentExpression(p) {
       if (member(p.node.left, "clientInfo")) {
         stores++;
-        requireContract(result && boundIdentifier(p.get("right"), result),
-          "Changed browser handshake result");
+        const right = p.get("right");
+        const awaited = right.isAwaitExpression() ? right.get("argument") : null;
+        requireContract(right.isIdentifier() ||
+          (awaited?.isCallExpression() && awaited.node.arguments[0]?.value === "getInfo") ||
+          (right.isCallExpression() && right.node.arguments[0]?.value === "getInfo"),
+        "Changed browser handshake result");
       }
     },
   });
-  requireContract(calls === 1 && stores === 1 && result?.constant,
+  requireContract(calls >= 1 && calls <= 2 && stores >= 1 && methodName !== undefined,
     "Changed browser client handshake");
   const send = methods.filter(p => p.isClassMethod() && !p.node.computed &&
     p.node.key.name === methodName);
@@ -188,7 +256,9 @@ export function inspectService(source) {
       const cls = binding.path.get("init");
       const methods = cls.get("body.body");
       const ctor = methods.find(p => p.node.kind === "constructor");
-      requireContract(ctor && ctor.node.params.length === 5 &&
+      const legacy = ctor?.node.params.length === 5;
+      const managed = ctor?.node.params.length === 7;
+      requireContract((legacy || managed) &&
         ctor.node.params.every(p => p.type === "Identifier"), "Unsupported constructor arguments");
       const assigned = new Map();
       let handlerBound = false;
@@ -209,23 +279,29 @@ export function inspectService(source) {
             p.node.arguments[0].name === ctor.node.params[1].name) handlerBound = true;
         },
       });
-      requireContract(handlerBound && assigned.get("apiTransport") === 0 &&
-        assigned.get("getTurnMetadata") === 2 && assigned.get("turnEndedTracker") === 3 &&
-        assigned.get("readRequestHeaderEnabled") === 4, "Changed callback contract");
+      if (legacy) {
+        requireContract(handlerBound && assigned.get("apiTransport") === 0 &&
+          assigned.get("getTurnMetadata") === 2 && assigned.get("turnEndedTracker") === 3 &&
+          assigned.get("readRequestHeaderEnabled") === 4, "Changed callback contract");
+      } else {
+        requireContract(handlerBound && assigned.get("apiTransport") === 0 &&
+          assigned.get("getTurnMetadata") === 2 && assigned.get("turnEndedTracker") === 3 &&
+          assigned.get("readRequestHeaders") === 4 && assigned.get("browserSurface") === 5 &&
+          assigned.get("assertAccess") === 6, "Changed managed callback contract");
+      }
       requireContract(member(args[1].node, "clientApi") &&
         args[2].isArrowFunctionExpression() && args[2].node.params.length === 0,
       "Changed browser arguments");
       const call = args[2].get("body");
       requireContract(call.isCallExpression() && call.get("callee").isIdentifier() &&
         call.node.arguments.length === 1 && member(call.node.arguments[0], "runtime") &&
-        args[4].isIdentifier(), "Changed callback arguments");
+        (legacy ? args[4].isIdentifier() : args[4].isArrowFunctionExpression() &&
+          args[4].node.async && args[4].node.params.length === 0),
+      "Changed callback arguments");
       const metadata = call.node.callee.name;
-      const policy = args[4].node.name;
       const metaBinding = call.scope.getBinding(metadata);
-      const policyBinding = path.scope.getBinding(policy);
-      requireContract(metaBinding?.constant && metaBinding.path.isFunctionDeclaration() &&
-        policyBinding?.constant && policyBinding.path.isFunctionDeclaration(),
-      "Unstable callback bindings");
+      requireContract(metaBinding?.constant && metaBinding.path.isFunctionDeclaration(),
+        "Unstable metadata callback binding");
       const literals = p => {
         const values = [];
         p.traverse({ StringLiteral(q) { values.push(q.node.value); } });
@@ -233,25 +309,46 @@ export function inspectService(source) {
       };
       requireContract(literals(metaBinding.path).includes("x-codex-turn-metadata") &&
         metaBinding.path.node.params.length === 1 &&
-        policyBinding.path.node.async && policyBinding.path.node.params.length === 0 &&
-        literals(policyBinding.path).includes("codex_browser_use_agent_request_header"),
-      "Changed metadata or policy protocol");
-      requireContract(shape(metaBinding.path) ===
-        "96146f3d4c51e5707a7cb38783b06294b1f60e9bbc1f0b0cba93c63d23222ce8" &&
-        shape(policyBinding.path) ===
-        "3c64bbeed6876be6468d1700b8f63c217b458ac1f495856ede7e7f939c9b3df2",
-      "Changed metadata or policy semantics");
+        shape(metaBinding.path) ===
+        "96146f3d4c51e5707a7cb38783b06294b1f60e9bbc1f0b0cba93c63d23222ce8",
+      "Changed metadata semantics");
+      let policy = "readRequestHeaders";
+      let callback;
+      if (legacy) {
+        policy = args[4].node.name;
+        const policyBinding = path.scope.getBinding(policy);
+        requireContract(policyBinding?.constant && policyBinding.path.isFunctionDeclaration() &&
+          policyBinding.path.node.async && policyBinding.path.node.params.length === 0 &&
+          literals(policyBinding.path).includes("codex_browser_use_agent_request_header") &&
+          shape(policyBinding.path) ===
+          "3c64bbeed6876be6468d1700b8f63c217b458ac1f495856ede7e7f939c9b3df2",
+        "Changed policy protocol");
+      } else {
+        const body = args[4].get("body");
+        requireContract(body.isOptionalCallExpression() && body.node.arguments.length === 0 &&
+          body.get("callee").isOptionalMemberExpression() &&
+          body.node.callee.optional === true && !body.node.callee.computed &&
+          member(body.node.callee.object, "preferences") &&
+          body.node.callee.property.name === "getExtensionRequestHeaders",
+        "Changed managed fallback policy");
+        callback = source.slice(args[4].node.start, args[4].node.end);
+        requireContract(callback.length > 0 && Buffer.byteLength(callback) <= 4096,
+          "Invalid managed fallback policy");
+      }
       const send = requestMethod(methods);
       const contractSha = shape(send);
       // Known shapes are a fast path, never the only admission path.
-      if (!protocolShapes.has(contractSha)) adaptiveRequest(send);
+      if (!protocolShapes.has(contractSha)) {
+        if (managed) adaptiveManagedRequest(send);
+        else adaptiveRequest(send);
+      }
       // Reject shadowing at the actual insertion site, not just the declaration.
       requireContract(path.scope.getBinding(metadata) === metaBinding &&
         !path.scope.getBinding("cppNativeIdentificationReader"), "Shadowed metadata binding");
       candidates.push({
         start: Buffer.byteLength(source.slice(0, args[4].node.start)),
         end: Buffer.byteLength(source.slice(0, args[4].node.end)),
-        policy, metadata, contractSha,
+        policy, metadata, contractSha, ...(callback === undefined ? {} : { callback }),
       });
     },
   });

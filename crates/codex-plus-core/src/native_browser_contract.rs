@@ -11,6 +11,8 @@ pub(super) struct Binding {
     pub policy: String,
     pub metadata: String,
     pub contract_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback: Option<String>,
 }
 
 impl Binding {
@@ -24,6 +26,7 @@ impl Binding {
                         || (index > 0 && byte.is_ascii_digit())
                 })
         }
+        let callback_source = self.callback.as_deref().unwrap_or(&self.policy);
         ensure!(
             self.contract_sha.len() == 64
                 && self
@@ -38,15 +41,18 @@ impl Binding {
         let text = std::str::from_utf8(source)?;
         ensure!(
             self.start < self.end
-                && text.get(self.start..self.end) == Some(self.policy.as_str())
+                && !callback_source.is_empty()
+                && callback_source.len() <= 4096
+                && !callback_source.contains('\0')
+                && text.get(self.start..self.end) == Some(callback_source)
                 && !text.contains("cppNativeIdentificationReader"),
             "Structural callback position changed"
         );
         let control =
             serde_json::to_string(&control.to_str().context("Non-Unicode control path")?)?;
         let callback = format!(
-            "cppNativeIdentificationReader(this.runtime,{},{},{control})",
-            self.policy, self.metadata
+            "cppNativeIdentificationReader(this.runtime,{callback_source},{},{control})",
+            self.metadata
         );
         let candidate_len = source
             .len()
@@ -308,6 +314,7 @@ mod tests {
             policy: "policy".into(),
             metadata: "meta".into(),
             contract_sha: "a".repeat(64),
+            callback: None,
         };
         assert!(
             binding
@@ -340,6 +347,37 @@ mod tests {
     }
 
     #[test]
+    fn managed_recovery_binding_preserves_the_exact_fallback_callback() {
+        let callback = "async()=>this.preferences?.getExtensionRequestHeaders()";
+        let source = format!(
+            "new cls(r,this.clientApi,()=>meta(this.runtime),this.turnEndedTracker,{callback})"
+        );
+        let start = source.len() - callback.len() - 1;
+        let binding = Binding {
+            start,
+            end: start + callback.len(),
+            policy: "readRequestHeaders".into(),
+            metadata: "meta".into(),
+            contract_sha: "c".repeat(64),
+            callback: Some(callback.into()),
+        };
+        let replaced = binding
+            .replace(source.as_bytes(), Path::new("C:/state/control.json"))
+            .unwrap();
+        let replaced = String::from_utf8(replaced).unwrap();
+        assert!(replaced.contains(&format!(
+            "cppNativeIdentificationReader(this.runtime,{callback},meta,"
+        )));
+        let mut changed = binding;
+        changed.callback = Some("async()=>other()".into());
+        assert!(
+            changed
+                .replace(source.as_bytes(), Path::new("C:/state/control.json"))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn executable_format_is_not_inferred_from_the_filename() {
         assert!(!pe_x64(b"fixture-node.exe"));
         let mut bytes = vec![0; 128];
@@ -362,6 +400,7 @@ mod tests {
             policy: "policy".into(),
             metadata: "meta".into(),
             contract_sha: "b".repeat(64),
+            callback: None,
         };
         let error = binding
             .replace(&source, Path::new("C:/state/control.json"))

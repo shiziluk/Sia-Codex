@@ -11,6 +11,9 @@ const { inspectService, inspectEntry } = require("../../../assets/native-browser
 const specimen = readFileSync(new URL(
   "../../../assets/native-browser/fixtures/service-specimen.mjs", import.meta.url,
 ), "utf8");
+const managedSpecimen = readFileSync(new URL(
+  "../../../assets/native-browser/fixtures/service-managed-specimen.mjs", import.meta.url,
+), "utf8");
 
 test("structural admission ignores formatting, comments and minifier identifiers", () => {
   const result = inspectService(specimen);
@@ -25,6 +28,25 @@ test("structural admission ignores formatting, comments and minifier identifiers
   assert.equal(current.metadata, "renamedMetadata");
   assert.equal(current.policy, "renamedPolicy");
   assert.equal(current.contractSha, result.contractSha);
+});
+
+test("managed request headers are admitted only through the bound fallback callback", () => {
+  const result = inspectService(managedSpecimen);
+  assert.equal(
+    Buffer.from(managedSpecimen).subarray(result.start, result.end).toString(),
+    "async()=>this.preferences?.getExtensionRequestHeaders()",
+  );
+  assert.equal(result.policy, "readRequestHeaders");
+  assert.doesNotThrow(() => inspectService(`/* non-ASCII offset: \u4e2d */\n${managedSpecimen}`));
+  for (const source of [
+    managedSpecimen.replace("async()=>this.preferences?.getExtensionRequestHeaders()",
+      "async()=>this.preferences?.getOtherRequestHeaders()"),
+    managedSpecimen.replace("o.request_headers=zE(s??[])", "o.request_headers=[]"),
+    managedSpecimen.replace("async()=>this.preferences?.getExtensionRequestHeaders()",
+      "policy"),
+    managedSpecimen.replace("this.readRequestHeaders=s", "this.readRequestHeaders=n"),
+    managedSpecimen.replace("this.sendRequest(r,{...n,...o})", "this.sendRequest(r,{...n})"),
+  ]) assert.throws(() => inspectService(source));
 });
 
 test("structural admission refuses protocol, metadata, handshake and constructor drift", () => {
@@ -93,9 +115,12 @@ test("real local service fixtures retain their structural contract", {
     const source = readFileSync(path, "utf8");
     const binding = inspectService(source);
     const bytes = Buffer.from(source);
-    assert.equal(bytes.subarray(binding.start, binding.end).toString(), binding.policy);
+    assert.equal(
+      bytes.subarray(binding.start, binding.end).toString(),
+      binding.callback ?? binding.policy,
+    );
     const helper = readFileSync(new URL("../../../assets/native-browser/require-identification.mjs", import.meta.url), "utf8");
-    const callback = `cppNativeIdentificationReader(this.runtime,${binding.policy},${binding.metadata},"C:/fixture/control.json")`;
+    const callback = `cppNativeIdentificationReader(this.runtime,${binding.callback ?? binding.policy},${binding.metadata},"C:/fixture/control.json")`;
     const candidate = Buffer.concat([
       bytes.subarray(0, binding.start), Buffer.from(callback), bytes.subarray(binding.end),
       Buffer.from(`\n${helper}`),
@@ -103,8 +128,8 @@ test("real local service fixtures retain their structural contract", {
     // Parse only: no proprietary browser, policy or approval implementation runs.
     require("@babel/parser").parse(candidate, { sourceType: "module" });
     assert.throws(() => inspectService(candidate));
-    assert.throws(() => inspectService(source.replaceAll(
-      "codex_browser_use_agent_request_header", "unrelated_feature",
-    )));
+    assert.throws(() => inspectService(binding.callback
+      ? source.replace(binding.callback, "async()=>this.preferences?.getOtherRequestHeaders()")
+      : source.replaceAll("codex_browser_use_agent_request_header", "unrelated_feature")));
   }
 });

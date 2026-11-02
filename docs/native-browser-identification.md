@@ -115,6 +115,16 @@ ask the original policy callback for caller identity and encounter
 that path even without the adapter. A successful `getInfo` probe alone does not
 test this request path.
 
+The managed request-header protocol used by `@oai/browser-desktop@0.1.1`
+instead passes a seven-argument constructor and replaces the Boolean policy with
+an array of destination request headers. The adapter accepts this shape only
+when the browser reports `requestHeadersVersion: 1`, the same registered
+Chrome/Edge extension pair is connected, and the local control is enabled. It
+preserves the original managed headers, replaces or appends only
+`x-browser-agent: ChatGPT/<session_id>`, and rejects malformed fallback data or
+the protocol's 16-header limit. Unknown versions, unsupported extensions,
+unstable callbacks and ambiguous request data flows still fall back unchanged.
+
 **Connection reporting.** Read-only discovery over the native pipe reports the
 connected extension's family, its reported identification state, and whether its
 extension ID is one of the two registered pairs above. An extension that
