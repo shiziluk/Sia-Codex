@@ -19,10 +19,21 @@ test("Codex 里有残留条目时提示并只提供移除", () => {
 
 test("macOS 与 Windows 使用原生 Computer Use 页面，其它平台不探测运行时", () => {
   assert.match(page, /computerUsePlatform === "macos" \|\| computerUsePlatform === "windows"/);
-  assert.match(page, /return computerUseSupported \? <ComputerUseNativePage \/> : <ComputerUseUnsupported \/>;/);
+  assert.match(page, /return computerUseSupported \? <ComputerUseNativePage onOpenWorkers=\{onOpenWorkers\} \/> : <ComputerUseUnsupported \/>;/);
   const unsupported = page.slice(page.indexOf("function ComputerUseUnsupported"), page.indexOf("function ComputerUseNativePage"));
   assert.ok(unsupported.includes("当前平台暂不支持 Computer Use"));
   assert.ok(!unsupported.includes("invoke("), "不支持的平台不应调用后端探测");
   assert.ok(page.includes("disabled={locked || computerUseIsWindows}"));
   assert.ok(page.includes("{!computerUseIsWindows ? <label className=\"cu-setting\">"));
+});
+
+test("browser extension management detects Chrome and Edge and links to worker management", () => {
+  assert.match(page, /type CuExtensionBrowser/);
+  assert.match(page, /computer_use_browser_extension_status/);
+  assert.match(page, /computer_use_open_extension_store", \{ browser \}/);
+  assert.match(page, /browser\.family === "edge" \? "Microsoft Edge" : "Google Chrome"/);
+  assert.match(page, /chrome 与 edge|Chrome \/ Edge/i);
+  assert.match(page, /cu-extension-browsers/);
+  assert.match(page, /cu-capability-summary/);
+  assert.match(page, /onOpenWorkers/);
 });

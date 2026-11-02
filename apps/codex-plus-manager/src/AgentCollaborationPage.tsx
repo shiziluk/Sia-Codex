@@ -8,9 +8,12 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  Activity,
   ArrowRightLeft,
+  Cable,
   Check,
   Copy,
+  FileText,
   GitMerge,
   Loader2,
   Maximize2,
@@ -18,6 +21,8 @@ import {
   RefreshCw,
   Save,
   Square,
+  Terminal,
+  WifiOff,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -266,8 +271,123 @@ const buildWorkflowDag = (workflow: WorkflowRecord, tasks: TaskRecord[]) => {
   };
 };
 
+type WorkerTestKind = "connection" | "task";
+type WorkerCenterProps = {
+  agents: Agent[];
+  availability: NonNullable<Snapshot["availability"]>;
+  tasks: TaskRecord[];
+  cwd: string;
+  busy: boolean;
+  maxQueuedPerAgent?: number;
+  onCwdChange: (value: string) => void;
+  onRunTest: (agentId: string, kind: WorkerTestKind) => void;
+  onOpenTask: (taskId: string) => void;
+  onBack: () => void;
+};
+
+function WorkerCenter({
+  agents,
+  availability,
+  tasks,
+  cwd,
+  busy,
+  maxQueuedPerAgent,
+  onCwdChange,
+  onRunTest,
+  onOpenTask,
+  onBack,
+}: WorkerCenterProps) {
+  const [expandedLogAgentId, setExpandedLogAgentId] = useState("");
+  return <div className="mg-page agent-collaboration-page worker-center-page">
+    <PageHeader icon={<Activity size={20} strokeWidth={1.5} />} title={t("Worker 控制中心")} actions={
+      <button className="mg-button" type="button" onClick={onBack}>
+        <ArrowRightLeft size={15} />{t("返回编排台")}
+      </button>
+    } />
+    <div className="agent-collaboration-content">
+      <section className="worker-center-intro" aria-labelledby="worker-center-title">
+        <div>
+          <h2 id="worker-center-title">{t("统一状态与连接验证")}</h2>
+          <p>{t("这里显示本机可执行文件、启用状态、模型和最近任务。登录与额度没有稳定查询接口，统一标记为执行时验证；测试连接会提交一个只读的真实探针任务。")}</p>
+        </div>
+        <label className="mg-field worker-center-cwd" htmlFor="worker-center-cwd">
+          <span>{t("测试任务工作目录")}</span>
+          <input
+            id="worker-center-cwd"
+            value={cwd}
+            disabled={busy}
+            placeholder="F:\\absolute\\path"
+            spellCheck={false}
+            onChange={(event) => onCwdChange(event.target.value)}
+          />
+          <small>{t("使用已存在的绝对路径。测试任务不会修改文件。")}</small>
+        </label>
+      </section>
+
+      <section className="worker-center-list" aria-label={t("Worker 列表")}>
+        {agents.map((agent) => {
+          const runtime = availability.find((item) => item.id === agent.id);
+          const queue = agentQueueState(tasks, agent.id, maxQueuedPerAgent, normalizeConcurrency(agent.maxConcurrentTasks));
+          const latest = tasks
+            .filter((task) => task.agentId === agent.id)
+            .sort((left, right) => right.createdAtMs - left.createdAtMs)[0];
+          const state = !agent.enabled ? "disabled" : runtime?.available === false ? "unavailable" : "ready";
+          const model = agent.id === "trae"
+            ? t("由 Trae 窗口选择")
+            : agent.model || (agent.id === "workbuddy" ? "hy3" : t("CLI 默认模型"));
+          const auth = agent.id === "deepseek" && agent.reuseSavedAuth
+            ? t("复用 DSH 已保存认证")
+            : t("执行时验证");
+          const executable = runtime?.path || agent.executable || t("自动发现");
+          const logsOpen = expandedLogAgentId === agent.id;
+          return <article className="worker-center-row" data-state={state} key={agent.id}>
+            <div className="worker-center-identity">
+              <span className="worker-center-icon" aria-hidden="true">{agent.id === "workbuddy" ? "WB" : agent.id === "deepseek" ? "DS" : agent.id === "trae" ? "TR" : agent.id === "claude" ? "CC" : "CX"}</span>
+              <div>
+                <strong>{agent.name}</strong>
+                <code title={executable}>{executable}</code>
+              </div>
+            </div>
+            <dl className="worker-center-facts">
+              <div><dt>{t("可用性")}</dt><dd data-state={state}>{state === "ready" ? t("可执行文件可用") : state === "disabled" ? t("未启用") : t("未找到可执行文件")}</dd></div>
+              <div><dt>{t("认证 / 额度")}</dt><dd>{auth} · {t("额度执行时验证")}</dd></div>
+              <div><dt>{t("模型")}</dt><dd>{model}</dd></div>
+              <div><dt>{t("并发")}</dt><dd>{tf("运行 {0}/{1} · 排队 {2}", [queue.running, queue.concurrency, queue.queued])}</dd></div>
+              <div><dt>{t("最近任务")}</dt><dd>{latest ? <><span data-state={latest.status}>{statusLabels[latest.status]}</span> · {formatTime(latest.updatedAtMs)}</> : t("暂无")}</dd></div>
+            </dl>
+            <div className="worker-center-actions">
+              <button className="mg-button" type="button" disabled={busy || state !== "ready" || !cwd.trim()} title={!cwd.trim() ? t("先填写测试任务工作目录") : undefined} onClick={() => onRunTest(agent.id, "connection")}>
+                {busy ? <Loader2 size={14} className="agent-collaboration-spin" /> : <Cable size={14} />}{t("测试连接")}
+              </button>
+              <button className="mg-button" type="button" disabled={busy || state !== "ready" || !cwd.trim()} title={!cwd.trim() ? t("先填写测试任务工作目录") : undefined} onClick={() => onRunTest(agent.id, "task")}>
+                <Terminal size={14} />{t("派一个测试任务")}
+              </button>
+              <button className="mg-button" type="button" disabled={!latest} aria-expanded={logsOpen} onClick={() => setExpandedLogAgentId(logsOpen ? "" : agent.id)}>
+                <FileText size={14} />{t("查看日志")}
+              </button>
+            </div>
+            {logsOpen && latest && <div className="worker-center-log" role="region" aria-label={tf("{0} 的最近任务日志", [agent.name])}>
+              <div className="worker-center-log-head">
+                <span><strong>{statusLabels[latest.status]}</strong> · {formatTime(latest.createdAtMs)}</span>
+                <button className="mg-button" type="button" onClick={() => onOpenTask(latest.id)}>{t("在任务详情中打开")}</button>
+              </div>
+              <pre>{latest.answer || latest.error || latest.progress || t("任务还没有输出。")}</pre>
+            </div>}
+          </article>;
+        })}
+      </section>
+
+      {agents.every((agent) => !agent.enabled) && <div className="worker-center-empty" role="status">
+        <WifiOff size={17} />
+        <p>{t("没有启用的 Worker。先返回编排台，在 Agent 配置中启用并保存。")}</p>
+      </div>}
+    </div>
+  </div>;
+}
+
 export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: string } = {}) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [pageView, setPageView] = useState<"orchestration" | "workers">("orchestration");
   const [runtime, setRuntime] = useState<CodexRuntime | null>(null);
   const [draft, setDraft] = useState<CollaborationConfig>(defaultConfig);
   // 运行上限输入框保留原始文本：输入过程中的空值或「1」→「15」这类中间态不能立刻钳制，
@@ -834,12 +954,70 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
       if (mounted.current && lifecycle.current === epoch) setMcpError(`复制失败：${errorText(error)}`);
     }
   };
+  const runWorkerTest = (workerId: string, kind: WorkerTestKind) => {
+    if (busyRef.current) return;
+    const testCwd = cwd.trim();
+    if (!absolutePath(testCwd)) {
+      setActionError(t("请先为 Worker 测试填写已存在的绝对工作目录。"));
+      return;
+    }
+    const agent = snapshot?.config.agents.find((item) => item.id === workerId);
+    if (!agent?.enabled) {
+      setActionError(t("该 Worker 尚未启用。"));
+      return;
+    }
+    if (snapshot?.availability?.find((item) => item.id === workerId)?.available === false) {
+      setActionError(t("该 Worker 的可执行文件不可用，请先检查路径。"));
+      return;
+    }
+    const previousIds = new Set(tasks.map((task) => task.id));
+    const prompt = kind === "connection"
+      ? "This is a Codex++ worker connectivity test. Reply only WORKER_OK. Do not modify files or run commands that change state."
+      : "This is a Codex++ worker test task. Reply only WORKER_TASK_OK. Do not modify files or run commands that change state.";
+    void mutate("submit", {
+      agentId: workerId,
+      prompt,
+      cwd: testCwd,
+    }, (next) => {
+      const created = [...next.tasks]
+        .sort((left, right) => right.createdAtMs - left.createdAtMs)
+        .find((task) => !previousIds.has(task.id));
+      if (created) setSelectedId(created.id);
+      setNotice(tf("{0} 的{1}已提交；只有任务完成并返回 WORKER_OK 或 WORKER_TASK_OK 才算连接成功。", [
+        agent.name,
+        kind === "connection" ? t("连接测试") : t("测试任务"),
+      ]));
+    });
+  };
+
+  if (pageView === "workers") {
+    return <WorkerCenter
+      agents={snapshot?.config.agents ?? draft.agents}
+      availability={snapshot?.availability ?? []}
+      tasks={tasks}
+      cwd={cwd}
+      busy={Boolean(busy)}
+      maxQueuedPerAgent={snapshot?.capabilities?.maxQueuedPerAgent}
+      onCwdChange={setCwd}
+      onRunTest={runWorkerTest}
+      onOpenTask={(taskId) => {
+        setSelectedId(taskId);
+        setPageView("orchestration");
+      }}
+      onBack={() => setPageView("orchestration")}
+    />;
+  }
 
   return <div className="mg-page agent-collaboration-page">
     <PageHeader icon={<ArrowRightLeft size={20} strokeWidth={1.5} />} title="Agent 编排台" actions={
-      <button className="mg-button" type="button" onClick={() => void refresh()} disabled={refreshing || Boolean(busy)}>
-        <RefreshCw size={15} className={refreshing ? "agent-collaboration-spin" : ""} />{refreshing ? "刷新中…" : "刷新"}
-      </button>
+      <>
+        <button className="mg-button" type="button" onClick={() => setPageView("workers")}>
+          <Activity size={15} />Worker 控制中心
+        </button>
+        <button className="mg-button" type="button" onClick={() => void refresh()} disabled={refreshing || Boolean(busy)}>
+          <RefreshCw size={15} className={refreshing ? "agent-collaboration-spin" : ""} />{refreshing ? "刷新中…" : "刷新"}
+        </button>
+      </>
     } />
     <div className="agent-collaboration-content" aria-busy={!snapshot && refreshing}>
       <div className="agent-collaboration-intro">

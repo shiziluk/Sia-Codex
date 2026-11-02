@@ -5005,7 +5005,7 @@ export function App() {
           {route === "recommendations" ? <RecommendationsScreen ads={ads} actions={actions} /> : null}
           {route === "agentCache" ? <AgentCachePanel /> : null}
           {route === "agentCollaboration" ? <AgentCollaborationPage /> : null}
-          {route === "computerUse" ? <ComputerUsePage /> : null}
+          {route === "computerUse" ? <ComputerUsePage onOpenWorkers={() => void navigate("agentCollaboration")} /> : null}
           {/* 置顶推荐位只放在网关总览一处，内容与「推荐内容」页同源；各 Agent 的概览不再重复。 */}
           {route === "hub" ? <SponsorBoard ads={ads} actions={actions} /> : null}
           {route === "hub" ? (
