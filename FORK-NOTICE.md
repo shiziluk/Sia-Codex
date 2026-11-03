@@ -9,8 +9,8 @@ xAI, or any other upstream vendor.
 ## Upstream
 
 - Upstream project: `https://github.com/BigPizzaV3/CodexPlusPlus`
-- Reviewed base release: `v2.1.4`
-- Base commit: `59bdcf1c020fa8f561e9607ee99d0e85d73b52e8`
+- Reviewed base release: `v2.2.0`
+- Reviewed upstream tip: `d33d59c9bd6220a1406c2fd3d7e7be830c1f3cf8`
 - Upstream license: AGPL-3.0-only
 
 ## License
