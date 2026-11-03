@@ -3,8 +3,9 @@
 **Sia-Codex 是 [CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的非官方下游定制版。**
 
 它侧重“多 Agent 编排与本地 Worker 管理”，不是 OpenAI、CodexPlusPlus、Anthropic、
-xAI 或其他上游厂商的官方版本。当前源码基线为 `d33d59c9`，对应上游 `v2.2.0`
-之后的 `main`；本仓库以 `AGPL-3.0-only` 分发。
+xAI 或其他上游厂商的官方版本。当前源码基线为上游 `main` 的 `d33d59c9`；该源码中的
+项目版本为 `2.2.0`，但 GitHub 上最新正式 Release 仍是 `v2.1.4`。本仓库以
+`AGPL-3.0-only` 分发。
 
 本 README 只介绍 Sia-Codex 的入口和相对上游的差异。通用供应商管理、网关协议、
 会话、MCP、Skills 和拓展市场仍以上游 CodexPlusPlus 文档为基线。
