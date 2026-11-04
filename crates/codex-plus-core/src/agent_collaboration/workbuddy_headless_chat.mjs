@@ -17,11 +17,17 @@ let target = null;
 const targetDeadline = Date.now() + 30000;
 while (!target && Date.now() < targetDeadline) {
   try {
-    const targets = await fetch(
-      `http://127.0.0.1:${port}/json/list`,
-    ).then((response) => response.json());
+    const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+      signal: AbortSignal.timeout(1000),
+    });
+    if (!response.ok) throw new Error(`CDP returned ${response.status}`);
+    const targets = await response.json();
     target = targets.find(
-      (entry) => entry.type === "page" && entry.title === "WorkBuddy",
+      (entry) =>
+        entry.type === "page" &&
+        entry.title === "WorkBuddy" &&
+        typeof entry.webSocketDebuggerUrl === "string" &&
+        entry.webSocketDebuggerUrl.length > 0,
     );
   } catch {}
   if (!target) {
@@ -142,15 +148,15 @@ await new Promise((resolve, reject) => {
 });
 await send("Runtime.enable");
 
-const newTask = await evaluate(`(() => {
+const newTask = await waitFor(`(() => {
   const button = document.querySelector(
     'button[data-track-id="agent_new_task_button_clicked"]',
   );
   if (!button) return false;
   button.click();
   return true;
-})()`);
-if (!newTask) throw new Error("WorkBuddy new-task button not found");
+})()`, 30000);
+if (!newTask) throw new Error("WorkBuddy new-task button not found within 30 seconds");
 
 const ready = await waitFor(`Boolean(
   document.querySelector('[role="textbox"][contenteditable="true"]')
