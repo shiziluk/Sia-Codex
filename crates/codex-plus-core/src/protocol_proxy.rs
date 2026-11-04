@@ -4019,6 +4019,9 @@ async fn open_responses_proxy_request_once(
         {
             return Ok(extension_rejected_response(&reason)?);
         }
+        if wire_api == UpstreamWireApi::Responses {
+            upstream_body = normalize_v2_agent_message_plaintext_for_responses(upstream_body);
+        }
         let mut key = None;
         let mut exec_adapted = forced_adapted;
         let send = async {
@@ -5848,7 +5851,9 @@ async fn upstream_request_parts(
         !crate::extension_gateway::builtin_replaced("builtin:request-conversion");
     let mut body = match relay.protocol {
         _ if !request_conversion => request_json,
-        RelayProtocol::Responses => request_json,
+        RelayProtocol::Responses => {
+            normalize_v2_agent_message_plaintext_for_responses(request_json)
+        }
         RelayProtocol::ChatCompletions => responses_to_chat_completions_with_options(
             request_json,
             relay.standard_openai_protocol,
@@ -8607,6 +8612,59 @@ fn agent_message_has_confirmed_plaintext_shape(content: &Value) -> bool {
         .iter()
         .any(|part| part.get("type").and_then(Value::as_str) == Some("encrypted_content"));
     has_payload_header && has_payload_fragment
+}
+
+/// 第三方 Responses 上游不认识 Codex 的 V2 `agent_message` 扩展项。对已确认的
+/// `Payload:` + 明文载荷，将其改写为标准 `message`/`user` 与 `input_text`，
+/// 既保留原始分片顺序，也避免上游忽略整个自定义 item。
+fn normalize_v2_agent_message_plaintext_for_responses(mut body: Value) -> Value {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return body;
+    };
+
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("agent_message") {
+            continue;
+        }
+        let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let has_payload_header = parts.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("input_text")
+                && part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.trim_end().ends_with("Payload:"))
+        });
+        if !has_payload_header {
+            continue;
+        }
+
+        let mut normalized_in_item = 0;
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("encrypted_content") {
+                continue;
+            }
+            let Some(value) = part.get("encrypted_content").and_then(Value::as_str) else {
+                continue;
+            };
+            if value.is_empty() || encrypted_content_value_is_opaque(value) {
+                continue;
+            }
+            *part = json!({ "type": "input_text", "text": value });
+            normalized_in_item += 1;
+        }
+        if normalized_in_item > 0 {
+            item["type"] = json!("message");
+            item["role"] = json!("user");
+            if let Some(object) = item.as_object_mut() {
+                object.remove("author");
+                object.remove("recipient");
+            }
+        }
+    }
+
+    body
 }
 
 fn responses_content_to_chat_content(

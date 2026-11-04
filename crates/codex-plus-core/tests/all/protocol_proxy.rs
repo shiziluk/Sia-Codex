@@ -413,6 +413,66 @@ fn chat_conversion_forwards_plaintext_encrypted_agent_content_in_order() {
     );
 }
 
+#[tokio::test]
+async fn responses_proxy_forwards_v2_agent_payload_as_input_text() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let response_body = json!({
+        "id": "resp_v2_agent",
+        "object": "response",
+        "output": []
+    })
+    .to_string();
+    let server = tokio::spawn(capture_request_with_response(
+        listener,
+        "application/json",
+        response_body,
+    ));
+    let request = json!({
+        "model": "deepseek-v4-flash",
+        "stream": false,
+        "input": [{
+            "type": "agent_message",
+            "id": "amsg_responses_probe",
+            "author": "/root",
+            "recipient": "/root/worker",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "Message Type: NEW_TASK Task name: /root/worker Payload:"
+                },
+                {
+                    "type": "encrypted_content",
+                    "encrypted_content": "RESPONSES_V2_AGENT_PAYLOAD_OK"
+                }
+            ]
+        }]
+    });
+    let settings = model_route_settings(
+        "deepseek-v4-flash",
+        "deepseek-v4-flash",
+        format!("http://{address}/v1"),
+    );
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let (_, sent) = server.await.unwrap();
+    assert_eq!(sent["input"][0]["type"], "message");
+    assert_eq!(sent["input"][0]["role"], "user");
+    assert!(sent["input"][0].get("author").is_none());
+    assert!(sent["input"][0].get("recipient").is_none());
+    let content = &sent["input"][0]["content"];
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[1]["type"], "input_text");
+    assert_eq!(content[1]["text"], "RESPONSES_V2_AGENT_PAYLOAD_OK");
+    assert!(content[1].get("encrypted_content").is_none());
+}
+
 #[test]
 fn chat_conversion_rejects_plaintext_encrypted_content_outside_agent_message() {
     let error = responses_to_chat_completions(json!({
